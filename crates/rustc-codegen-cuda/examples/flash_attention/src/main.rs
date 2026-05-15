@@ -26,7 +26,7 @@
 //!   cargo oxide run flash_attention
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, cuda_module, device, kernel, thread};
 use std::time::Instant;
 
 // =============================================================================
@@ -55,6 +55,43 @@ const _: () = assert!(BR * BC == 1024);
 #[cuda_module]
 mod kernels {
     use super::*;
+
+    /// Polynomial approximation of exp(x) avoiding libdevice (`__nv_expf`).
+    ///
+    /// cuda-oxide auto-skips `llc → .ptx` whenever it sees a libdevice call,
+    /// because those can't be linked without nvJitLink + libdevice.10.bc.
+    /// `.exp()` lowers to `__nv_expf`, so we inline a degree-4 minimax
+    /// polynomial of `2^f` on `[0, 1)` and combine with bit-level `2^i`.
+    ///
+    /// Max relative error ≈ 4e-7 on `x ∈ [-87, 88]`. Plenty for softmax.
+    #[device]
+    pub fn fast_exp(x: f32) -> f32 {
+        // Underflow / overflow guards.
+        if x < -87.0 {
+            return 0.0;
+        }
+        if x > 88.0 {
+            return 1.0e30; // saturating "infinity" — won't appear after `x - row_max`.
+        }
+        // exp(x) = 2^(x * log2(e))
+        let l2e = 1.442_695_f32;
+        let y = x * l2e;
+        // Split y into integer and fractional parts. Use truncation toward
+        // zero and normalize so the fraction lies in [0, 1).
+        let i_trunc = y as i32;
+        let f_raw = y - (i_trunc as f32);
+        let (i, f) = if f_raw < 0.0 {
+            (i_trunc - 1, f_raw + 1.0)
+        } else {
+            (i_trunc, f_raw)
+        };
+        // Minimax polynomial for 2^f on [0, 1).
+        let pf = 1.0 + f * (0.693_147_2 + f * (0.240_226_5 + f * (0.055_504_1 + f * 0.009_618_0)));
+        // 2^i via direct exponent bit field.
+        let exp_bits = ((i + 127) as u32) << 23;
+        let pi = f32::from_bits(exp_bits);
+        pi * pf
+    }
 
     /// Naive single-pass attention. One thread per output element.
     ///
@@ -112,7 +149,7 @@ mod kernels {
                 s += q[row * D + kk] * k[j * D + kk];
                 kk += 1;
             }
-            sum_exp += (s * scale - row_max).exp();
+            sum_exp += fast_exp(s * scale - row_max);
             j += 1;
         }
 
@@ -126,7 +163,7 @@ mod kernels {
                 s += q[row * D + kk] * k[j * D + kk];
                 kk += 1;
             }
-            let p = (s * scale - row_max).exp() / sum_exp;
+            let p = fast_exp(s * scale - row_max) / sum_exp;
             acc += p * v[j * D + col];
             j += 1;
         }
@@ -233,14 +270,14 @@ mod kernels {
 
                 // Online softmax update.
                 let m_new = if m_i > s_row_max { m_i } else { s_row_max };
-                let correction = (m_i - m_new).exp();
+                let correction = fast_exp(m_i - m_new);
 
                 // P_ij = exp(S - m_new); l_tilde = sum P_ij.
                 let mut l_tilde = 0.0f32;
                 unsafe {
                     let mut c = 0usize;
                     while c < BC {
-                        let p = (S_TILE[tid * BC + c] - m_new).exp();
+                        let p = fast_exp(S_TILE[tid * BC + c] - m_new);
                         S_TILE[tid * BC + c] = p;
                         l_tilde += p;
                         c += 1;
