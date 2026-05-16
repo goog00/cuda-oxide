@@ -17,6 +17,7 @@ pub mod barrier;
 pub mod clc;
 pub mod cluster;
 pub mod constant;
+pub mod convert;
 pub mod cooperative_groups;
 pub mod cusimd;
 pub mod debug;
