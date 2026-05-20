@@ -101,7 +101,7 @@ use std::path::PathBuf;
 /// This is a simplified conversion that handles common FFI types.
 /// For device code, we primarily deal with:
 /// - Primitives: i8, i16, i32, i64, f32, f64
-/// - Pointers: all become `ptr` (opaque pointers)
+/// - Pointers: all become `ptr addrspace(1)` for NVVM IR 2.0 compatibility
 /// - Unit: becomes `void`
 fn rustc_ty_to_llvm_type_string(ty: Ty<'_>) -> String {
     match ty.kind() {
@@ -140,15 +140,16 @@ fn rustc_ty_to_llvm_type_string(ty: Ty<'_>) -> String {
         // Unit type (void in LLVM)
         TyKind::Tuple(tys) if tys.is_empty() => "void".to_string(),
 
-        // Pointers and references - all become opaque ptr in LLVM 20+
-        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => "ptr".to_string(),
+        // Pointers and references - use ptr addrspace(1) for NVVM IR 2.0 compatibility
+        // NVVM IR requires explicit address space in function declarations
+        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => "ptr addrspace(1)".to_string(),
 
         // Never type - we shouldn't see this in extern signatures
         TyKind::Never => "void".to_string(),
 
-        // For any other type, use ptr as a fallback
+        // For any other type, use ptr addrspace(1) as a fallback
         // This handles arrays, slices, structs, etc. that are passed by pointer
-        _ => "ptr".to_string(),
+        _ => "ptr addrspace(1)".to_string(),
     }
 }
 
