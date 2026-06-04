@@ -193,6 +193,10 @@ enum RustFloatMathIntrinsic {
     MaxNumNszF64,
     MinNumNszF32,
     MinNumNszF64,
+    Atan2F32,
+    Atan2F64,
+    AtanF32,
+    AtanF64,
 }
 
 impl RustFloatMathIntrinsic {
@@ -242,6 +246,10 @@ impl RustFloatMathIntrinsic {
             rust_intrinsics::CALLEE_MAXNUM_NSZ_F64 => Some(Self::MaxNumNszF64),
             rust_intrinsics::CALLEE_MINNUM_NSZ_F32 => Some(Self::MinNumNszF32),
             rust_intrinsics::CALLEE_MINNUM_NSZ_F64 => Some(Self::MinNumNszF64),
+            rust_intrinsics::CALLEE_ATAN2_F32 => Some(Self::Atan2F32),
+            rust_intrinsics::CALLEE_ATAN2_F64 => Some(Self::Atan2F64),
+            rust_intrinsics::CALLEE_ATAN_F32 => Some(Self::AtanF32),
+            rust_intrinsics::CALLEE_ATAN_F64 => Some(Self::AtanF64),
             _ => None,
         }
     }
@@ -302,6 +310,10 @@ impl RustFloatMathIntrinsic {
             Self::MaxNumNszF64 => Ok("__nv_fmax"),
             Self::MinNumNszF32 => Ok("__nv_fminf"),
             Self::MinNumNszF64 => Ok("__nv_fmin"),
+            Self::Atan2F32 => Ok("__nv_atan2f"),
+            Self::Atan2F64 => Ok("__nv_atan2"),
+            Self::AtanF32 => Ok("__nv_atanf"),
+            Self::AtanF64 => Ok("__nv_atan"),
         }
     }
 
@@ -317,7 +329,9 @@ impl RustFloatMathIntrinsic {
             | Self::MaxNumNszF32
             | Self::MaxNumNszF64
             | Self::MinNumNszF32
-            | Self::MinNumNszF64 => 2,
+            | Self::MinNumNszF64
+            | Self::Atan2F32
+            | Self::Atan2F64 => 2,
             Self::FmaF32 | Self::FmaF64 | Self::FmuladdF32 | Self::FmuladdF64 => 3,
             _ => 1,
         }
@@ -1162,6 +1176,22 @@ mod tests {
                 rust_intrinsics::CALLEE_MINNUM_NSZ_F64,
                 RustFloatMathIntrinsic::MinNumNszF64,
             ),
+            (
+                rust_intrinsics::CALLEE_ATAN2_F32,
+                RustFloatMathIntrinsic::Atan2F32,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN2_F64,
+                RustFloatMathIntrinsic::Atan2F64,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN_F32,
+                RustFloatMathIntrinsic::AtanF32,
+            ),
+            (
+                rust_intrinsics::CALLEE_ATAN_F64,
+                RustFloatMathIntrinsic::AtanF64,
+            ),
         ];
 
         for (name, expected) in cases {
@@ -1186,6 +1216,10 @@ mod tests {
         assert_eq!(RustFloatMathIntrinsic::PowiF32.arg_count(), 2);
         assert_eq!(RustFloatMathIntrinsic::PowfF64.arg_count(), 2);
         assert_eq!(RustFloatMathIntrinsic::CopysignF32.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::Atan2F32.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::Atan2F64.arg_count(), 2);
+        assert_eq!(RustFloatMathIntrinsic::AtanF32.arg_count(), 1);
+        assert_eq!(RustFloatMathIntrinsic::AtanF64.arg_count(), 1);
         assert_eq!(RustFloatMathIntrinsic::FmaF32.arg_count(), 3);
         assert_eq!(RustFloatMathIntrinsic::FmuladdF64.arg_count(), 3);
         assert_eq!(RustFloatMathIntrinsic::MaxNumNszF32.arg_count(), 2);

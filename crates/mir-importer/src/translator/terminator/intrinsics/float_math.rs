@@ -105,6 +105,14 @@ pub enum RustFloatMathIntrinsic {
     MinNumNszF32,
     /// `core::intrinsics::minimum_number_nsz_f64` (backs `f64::min`).
     MinNumNszF64,
+    /// `f32::atan2` / `std::sys::cmath::atan2f`.
+    Atan2F32,
+    /// `f64::atan2` / `std::sys::cmath::atan2`.
+    Atan2F64,
+    /// `f32::atan` / `std::sys::cmath::atanf`.
+    AtanF32,
+    /// `f64::atan` / `std::sys::cmath::atan`.
+    AtanF64,
 }
 
 impl RustFloatMathIntrinsic {
@@ -170,6 +178,10 @@ impl RustFloatMathIntrinsic {
             | "std::intrinsics::minimum_number_nsz_f32" => Some(Self::MinNumNszF32),
             "core::intrinsics::minimum_number_nsz_f64"
             | "std::intrinsics::minimum_number_nsz_f64" => Some(Self::MinNumNszF64),
+            "std::sys::cmath::atan2f" => Some(Self::Atan2F32),
+            "std::sys::cmath::atan2" => Some(Self::Atan2F64),
+            "std::sys::cmath::atanf" => Some(Self::AtanF32),
+            "std::sys::cmath::atan" => Some(Self::AtanF64),
             _ => None,
         }
     }
@@ -220,6 +232,10 @@ impl RustFloatMathIntrinsic {
             Self::MaxNumNszF64 => rust_intrinsics::CALLEE_MAXNUM_NSZ_F64,
             Self::MinNumNszF32 => rust_intrinsics::CALLEE_MINNUM_NSZ_F32,
             Self::MinNumNszF64 => rust_intrinsics::CALLEE_MINNUM_NSZ_F64,
+            Self::Atan2F32 => rust_intrinsics::CALLEE_ATAN2_F32,
+            Self::Atan2F64 => rust_intrinsics::CALLEE_ATAN2_F64,
+            Self::AtanF32 => rust_intrinsics::CALLEE_ATAN_F32,
+            Self::AtanF64 => rust_intrinsics::CALLEE_ATAN_F64,
         }
     }
 }
