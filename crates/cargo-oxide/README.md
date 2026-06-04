@@ -10,7 +10,7 @@ Replaces the previous `xtask` pattern with a proper cargo subcommand that works 
 
 **External users**:
 
-You must build cuda-oxide in Rust nightly mode.
+Install with the project's pinned nightly toolchain:
 
 ```bash
 cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide

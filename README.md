@@ -130,9 +130,9 @@ cargo oxide debug vecadd --tui
 
 #### cargo-oxide
 
-Inside the cuda-oxide repo, `cargo oxide` works out of the box via a workspace alias, and you must build cuda-oxide in Rust nightly mode.
+Inside the cuda-oxide repo, `cargo oxide` works out of the box via a workspace alias.
 
-For use outside the repo (your own projects):
+For use outside the repo (your own projects), install it with the pinned nightly toolchain:
 
 ```bash
 cargo +nightly-2026-04-03 install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
@@ -247,7 +247,7 @@ cargo oxide run gemm_sol
 | `cuda-host`         | Typed module loading, launch helpers, LTOIR loader                        |
 | `cuda-macros`       | Proc macros (`#[cuda_module]`, `#[kernel]`, `gpu_printf!`)                |
 | `cuda-bindings`     | Raw `bindgen` FFI bindings to `cuda.h`                                    |
-| `cuda-core`         | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`, `PinnedHostBuffer<T>`) |
+| `cuda-core`         | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`, ...)  |
 | `cuda-async`        | Async execution layer (`DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`) |
 | `libnvvm-sys`       | `dlopen` bindings to libNVVM (used by `cuda-host::ltoir`)                 |
 | `nvjitlink-sys`     | `dlopen` bindings to nvJitLink (used by `cuda-host::ltoir`)               |
