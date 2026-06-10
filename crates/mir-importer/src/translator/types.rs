@@ -516,43 +516,119 @@ pub fn translate_type(
                 } else {
                     // Enums have multiple variants.
                     //
-                    // Determine the discriminant type. If the user wrote an
-                    // explicit `#[repr(uN)]` / `#[repr(iN)]` / `#[repr(usize)]`
-                    // / `#[repr(isize)]`, honour that width and signedness so
-                    // that `*const E` pointer arithmetic and per-element loads
-                    // stride / size correctly. Otherwise fall back to the
-                    // smallest unsigned width that fits all variants (the
-                    // rustc default for plain `enum E { .. }`).
-                    let (discriminant_bits, discriminant_signed): (u32, bool) =
-                        match adt_def.repr().int {
-                            Some(rustc_public::abi::IntegerType::Fixed { length, is_signed }) => {
-                                (length.bits() as u32, is_signed)
-                            }
-                            Some(rustc_public::abi::IntegerType::Pointer { is_signed }) => {
-                                // `#[repr(isize)]` / `#[repr(usize)]`. NVPTX
-                                // targets pointer-sized integers as 64-bit.
-                                (64u32, is_signed)
-                            }
-                            None => {
-                                let bits: u32 = if variants.len() <= 256 {
-                                    8
-                                } else if variants.len() <= 65536 {
-                                    16
+                    // The discriminant ("tag") type comes from rustc's layout,
+                    // never from a guess: `#[repr(uN/iN)]` (width AND
+                    // signedness), `#[repr(usize/isize)]`, `#[repr(C)]`,
+                    // sparse discriminants (`enum E { A = 0, B = 1_000_000 }`
+                    // gets a u32 tag) and negative discriminants
+                    // (`enum E { N = -1, Z = 0 }` gets a SIGNED i8 tag, so a
+                    // later `e as i32` sign-extends instead of zero-extending)
+                    // all fall out of the single `TagEncoding::Direct` arm
+                    // below.
+                    let enum_name = trimmed_name.to_string();
+                    let layout_shape = rust_ty
+                        .layout()
+                        .map_err(|e| {
+                            input_error_noloc!(TranslationErr::unsupported(format!(
+                                "Failed to query enum layout for {}: {:?}",
+                                enum_name, e
+                            )))
+                        })?
+                        .shape();
+
+                    // Fallback tag used where the un-niched `MirEnumType`
+                    // model is deliberately self-consistent rather than
+                    // memory-faithful (the niched and single-variant arms
+                    // below): smallest unsigned width that fits the variant
+                    // count.
+                    let variant_count_bits: u32 = if variants.len() <= 256 {
+                        8
+                    } else if variants.len() <= 65536 {
+                        16
+                    } else {
+                        32
+                    };
+
+                    let discriminant_ty: Ptr<TypeObj> = match &layout_shape.variants {
+                        rustc_public::abi::VariantsShape::Multiple {
+                            tag,
+                            tag_encoding: rustc_public::abi::TagEncoding::Direct,
+                            ..
+                        } => {
+                            let primitive = match tag {
+                                rustc_public::abi::Scalar::Initialized { value, .. }
+                                | rustc_public::abi::Scalar::Union { value } => *value,
+                            };
+                            let rustc_public::abi::Primitive::Int { length, signed } = primitive
+                            else {
+                                return input_err_noloc!(TranslationErr::unsupported(format!(
+                                    "Direct enum tag for {} is not an integer: {:?}",
+                                    enum_name, primitive
+                                )));
+                            };
+                            pliron::builtin::types::IntegerType::get(
+                                ctx,
+                                length.bits() as u32,
+                                if signed {
+                                    pliron::builtin::types::Signedness::Signed
                                 } else {
-                                    32
-                                };
-                                (bits, false)
-                            }
-                        };
-                    let discriminant_ty = pliron::builtin::types::IntegerType::get(
-                        ctx,
-                        discriminant_bits,
-                        if discriminant_signed {
-                            pliron::builtin::types::Signedness::Signed
-                        } else {
-                            pliron::builtin::types::Signedness::Unsigned
-                        },
-                    );
+                                    pliron::builtin::types::Signedness::Unsigned
+                                },
+                            )
+                            .into()
+                        }
+                        rustc_public::abi::VariantsShape::Multiple {
+                            tag_encoding: rustc_public::abi::TagEncoding::Niche { .. },
+                            ..
+                        } => {
+                            // Niched enums are deliberately modelled un-niched:
+                            // `MirEnumType` keeps an explicit variant-count tag
+                            // and mir-lower rebuilds the un-niched aggregate
+                            // from `NicheEncodingAttr`
+                            // (`emit_scalar_to_niched_enum`). Reading rustc's
+                            // niche tag (which is the payload scalar itself)
+                            // here would break that contract.
+                            pliron::builtin::types::IntegerType::get(
+                                ctx,
+                                variant_count_bits,
+                                pliron::builtin::types::Signedness::Unsigned,
+                            )
+                            .into()
+                        }
+                        rustc_public::abi::VariantsShape::Single { .. } => {
+                            // NOT an error: rustc reports `Single` for
+                            // multi-syntactic-variant enums where all but one
+                            // variant is uninhabited (e.g.
+                            // `Result<T, Infallible>` from `TryFrom`). There
+                            // is no tag in memory; keep the variant-count tag
+                            // so in-kernel construct + discriminant reads stay
+                            // self-consistent.
+                            pliron::builtin::types::IntegerType::get(
+                                ctx,
+                                variant_count_bits,
+                                pliron::builtin::types::Signedness::Unsigned,
+                            )
+                            .into()
+                        }
+                        rustc_public::abi::VariantsShape::Empty => {
+                            // Fully uninhabited enums (e.g. `Infallible`)
+                            // appear in statically-dead paths of core library
+                            // code (`Result<T, Infallible>` match arms,
+                            // iterator adapters). The TYPE must translate so
+                            // those dead arms lower; rustc gives it a
+                            // zero-sized layout with no tag. Keep the
+                            // variant-count tag for shape consistency.
+                            // Materializing a VALUE of an uninhabited enum
+                            // still fails loudly ("Cannot materialize a
+                            // constant for an uninhabited enum", rvalue.rs).
+                            pliron::builtin::types::IntegerType::get(
+                                ctx,
+                                variant_count_bits,
+                                pliron::builtin::types::Signedness::Unsigned,
+                            )
+                            .into()
+                        }
+                    };
 
                     // Translate each variant
                     let mut enum_variants = Vec::with_capacity(variants.len());
@@ -569,13 +645,7 @@ pub fn translate_type(
                     }
 
                     // Create the enum type
-                    Ok(MirEnumType::get(
-                        ctx,
-                        trimmed_name.to_string(),
-                        discriminant_ty.into(),
-                        enum_variants,
-                    )
-                    .into())
+                    Ok(MirEnumType::get(ctx, enum_name, discriminant_ty, enum_variants).into())
                 }
             }
         }
