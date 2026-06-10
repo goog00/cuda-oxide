@@ -2,39 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /*
- * Minimal reproduction for a rustc-codegen-cuda closure-indexing miscompile
- * found while reducing a CUDA kernel that indexed a two-slot wrapper through
- * a closure.
+ * References and raw pointers into indexed places.
  *
- * Symptom: in
+ * Kernels take addresses of runtime-indexed elements through every shape
+ * the address walker must handle:
  *
- *     let compute = |idx: usize| { ... arr[idx] ... };
- *     [compute(0), compute(1)]
+ *     let compute = |idx: usize| { ... arr[idx] ... };   // closure captures
+ *     &p.0[k]                                            // field + runtime index
+ *     &(*p).0[1]                                         // deref + const index
+ *     addr_of! / addr_of_mut!                            // raw-pointer paths
+ *     &mut local.field[k]                                // write-through
+ *     struct Holder<'a>(&'a [f32; 2]); &h.0[k]           // deref in the tail
  *
- * both invocations produce identical results, equal to what `compute(0)`
- * should produce. The `idx` parameter is silently ignored at the load
- * site.
- *
- * The corresponding LLVM IR (--emit llvm-ir) shows:
- *
- *     %v3 = phi i64 [ %v1, %entry ]                       ; idx
- *     %v6 = icmp ult i64 %v3, 2                           ; bounds check OK
- *     br i1 %v6, label %bb1, label %bb4
- *   bb1:
- *     %v7 = getelementptr inbounds { [2 x float] }, ptr %v5, i32 0, i32 0
- *                                                          ; ^ idx ignored
- *     %v9 = load float, ptr %v8                           ; always slot 0
- *
- * Each kernel below writes the *difference* compute(1) - compute(0). If
- * the closure indexing works the difference is non-zero (input designed
- * so it must differ); if the miscompile triggers the difference is 0.
+ * Each kernel writes the difference compute(1) - compute(0), with inputs
+ * designed so the two slots differ: a dropped index reads slot 0 twice
+ * and reports 0 instead of 5.
  *
  * Build:
- *     cargo oxide run closure_index_miscompile
+ *     cargo oxide run ref_index_projections
  *
- * Before the fix, the variants that route a runtime index through the tail
- * of a field-projected `Rvalue::Ref` report diff = 0. With the fix, all
- * variants report diff = 5.
+ * Guards the fix for issue #120 (Rvalue::Ref dropped runtime Index
+ * projections, returning the field's base address).
  */
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
@@ -666,7 +654,7 @@ where
 }
 
 fn main() {
-    println!("=== Closure-index miscompile minimal repro ===\n");
+    println!("=== ref_index_projections: addresses of indexed places ===\n");
 
     let ctx = CudaContext::new(0).expect("CUDA init");
     let stream = ctx.default_stream();

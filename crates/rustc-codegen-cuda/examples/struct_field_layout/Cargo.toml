@@ -1,5 +1,5 @@
 [package]
-name = "struct_layout_repro"
+name = "struct_field_layout"
 version = "0.1.0"
 edition = "2024"
 authors = ["Nihal Pasham <nihalp@nvidia.com>"]
@@ -15,7 +15,7 @@ license = "Apache-2.0"
 # [N x i8] padding slots. Pre-fix this either failed lowering loudly or
 # silently read the wrong field on the GPU.
 # Run with:
-#   cargo oxide run struct_layout_repro
+#   cargo oxide run struct_field_layout
 
 [dependencies]
 cuda-device = { path = "../../../cuda-device" }

@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! End-to-end repro for issue #128: kernel silently reads the wrong struct
-//! field for a reordered/padded repr(Rust) struct.
+//! Field access on reordered/padded repr(Rust) structs.
 //!
 //! `Arena` declares fields (layout, cap, stride, big). rustc reorders them
 //! in memory, and the enum field `Layout` occupies 8 bytes in rustc's
@@ -17,16 +16,14 @@
 //!           layout=0     pad=1     big=2 cap=3 stride=4
 //! ```
 //!
-//! Pre-fix, mir-lower's aggregate sites counted only real (non-pad)
-//! fields when mapping declaration indices to LLVM slots, yielding cap=2
-//! (the padding slot) and stride=3 (cap's slot): either a loud lowering
-//! failure ("IntToInt: source is not an integer" / insertvalue type
-//! mismatch) or a silent wrong-field read. Post-fix every site shares the
-//! type converter's slot map, so each lane must compute
+//! Every aggregate site in mir-lower shares the type converter's slot map
+//! (declaration index -> LLVM slot, padding-aware, ZST-aware), so field
+//! reads must land on the right slot regardless of reorder and padding.
+//! Guards the fix for issue #128: each lane must compute
 //! `cap * 1000 + stride + big` from the right fields; the host verifies
 //! the value and exits 1 on any mismatch.
 //!
-//! Run: `cargo oxide run struct_layout_repro`
+//! Run: `cargo oxide run struct_field_layout`
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
@@ -85,7 +82,7 @@ mod kernels {
 }
 
 fn main() {
-    println!("=== struct_layout_repro (issue #128) ===\n");
+    println!("=== struct_field_layout (issue #128) ===\n");
 
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
     let stream = ctx.default_stream();

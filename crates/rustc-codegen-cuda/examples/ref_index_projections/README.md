@@ -1,4 +1,4 @@
-# closure_index_miscompile
+# ref_index_projections
 
 Minimal reproduction for a `rustc-codegen-cuda` miscompile where a closure that
 takes `idx: usize` and reads a captured array through that index has the
@@ -106,8 +106,8 @@ marker and exits non-zero on any failure).
 From the cuda-oxide repository root:
 
 ```bash
-cargo oxide run closure_index_miscompile
-cargo oxide pipeline closure_index_miscompile    # dump MIR + LLVM IR
+cargo oxide run ref_index_projections
+cargo oxide pipeline ref_index_projections    # dump MIR + LLVM IR
 ```
 
 Requires a CUDA-capable GPU and the cuda-oxide rustc toolchain.

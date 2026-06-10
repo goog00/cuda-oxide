@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn slot_map_issue128_arena_shape() {
         let mut ctx = make_ctx();
-        // The exact shape from issue #128 (examples/struct_layout_repro):
+        // The exact shape from issue #128 (examples/struct_field_layout):
         //
         //   enum Layout { Aos, Soa, AoSoA(u32) }          // -> { i8, i32 }
         //   struct Arena { layout: Layout, cap: u32, stride: u32, big: u64 }
