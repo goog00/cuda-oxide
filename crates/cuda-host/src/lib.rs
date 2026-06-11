@@ -93,7 +93,7 @@ pub use launch::{
     KernelSliceArg, KernelSliceArgMut, load_cuda_module_from_async_context,
     load_kernel_module_async, new_async_kernel_launch, new_owned_async_kernel_launch,
     push_async_kernel_scalar, push_async_read_only_device_slice, push_async_writable_device_slice,
-    set_async_kernel_cluster_dim,
+    set_async_kernel_cluster_dim, set_async_kernel_cooperative,
 };
 
 #[cfg(feature = "async")]

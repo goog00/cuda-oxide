@@ -287,6 +287,15 @@ pub fn set_async_kernel_cluster_dim(
 
 #[doc(hidden)]
 #[cfg(feature = "async")]
+pub fn set_async_kernel_cooperative(
+    launch: &mut cuda_async::launch::AsyncKernelLaunch<'_>,
+    cooperative: bool,
+) {
+    launch.set_cooperative(cooperative);
+}
+
+#[doc(hidden)]
+#[cfg(feature = "async")]
 pub fn push_async_kernel_scalar<'a, T: KernelScalar + 'a>(
     launch: &mut cuda_async::launch::AsyncKernelLaunch<'a>,
     value: T,
