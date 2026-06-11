@@ -23,10 +23,11 @@ The dialect defines seven types that preserve Rust-level semantics:
 `MirEnumType` carries the layout-truth tag type (width and signedness
 from rustc's layout), the variant names, the declared discriminant
 VALUES (not variant indices), per-variant field counts, the flattened
-field types, and total size / ABI alignment in bytes (0 = unknown):
+field types, the flattened rustc field byte offsets, the tag byte
+offset, and total size / ABI alignment in bytes (0 = unknown):
 
 ```text
-mir.enum<"Ordering", si8, ["Less", "Equal", "Greater"], [255, 0, 1], [0, 0, 0], [], 1, 1>
+mir.enum<"Ordering", si8, ["Less", "Equal", "Greater"], [255, 0, 1], [0, 0, 0], [], [], 0, 1, 1>
 ```
 
 `Ordering::Less` is declared as -1, stored as the unsigned i8 bit

@@ -542,12 +542,35 @@ pub struct EnumVariant {
     pub name: String,
     /// Field types for this variant (empty for unit variants like None)
     pub field_types: Vec<Ptr<TypeObj>>,
+    /// Byte offset of each field within the enum, from rustc's layout
+    /// (parallel to `field_types`). Variants OVERLAP in Rust's layout, so
+    /// offsets from different variants may coincide. Empty when layout is
+    /// unknown (niched / single-variant models).
+    pub field_offsets: Vec<u64>,
 }
 
 impl EnumVariant {
-    /// Create a new enum variant.
+    /// Create a new enum variant with unknown field offsets.
     pub fn new(name: String, field_types: Vec<Ptr<TypeObj>>) -> Self {
-        EnumVariant { name, field_types }
+        EnumVariant {
+            name,
+            field_types,
+            field_offsets: vec![],
+        }
+    }
+
+    /// Create a new enum variant carrying rustc-layout byte offsets for
+    /// each field (parallel to `field_types`).
+    pub fn new_with_offsets(
+        name: String,
+        field_types: Vec<Ptr<TypeObj>>,
+        field_offsets: Vec<u64>,
+    ) -> Self {
+        EnumVariant {
+            name,
+            field_types,
+            field_offsets,
+        }
     }
 
     /// Create a unit variant (no fields).
@@ -555,6 +578,7 @@ impl EnumVariant {
         EnumVariant {
             name,
             field_types: vec![],
+            field_offsets: vec![],
         }
     }
 }
@@ -583,7 +607,7 @@ impl EnumVariant {
 /// * Discriminant type must be an integer type.
 #[pliron_type(
     name = "mir.enum",
-    format = "`<` $name `,` $discriminant_ty `,` `[` vec($variant_names, CharSpace(`,`)) `]` `,` `[` vec($variant_discriminants, CharSpace(`,`)) `]` `,` `[` vec($variant_field_counts, CharSpace(`,`)) `]` `,` `[` vec($all_field_types, CharSpace(`,`)) `]` `,` $total_size `,` $abi_align `>`"
+    format = "`<` $name `,` $discriminant_ty `,` `[` vec($variant_names, CharSpace(`,`)) `]` `,` `[` vec($variant_discriminants, CharSpace(`,`)) `]` `,` `[` vec($variant_field_counts, CharSpace(`,`)) `]` `,` `[` vec($all_field_types, CharSpace(`,`)) `]` `,` `[` vec($all_field_offsets, CharSpace(`,`)) `]` `,` $tag_offset `,` $total_size `,` $abi_align `>`"
 )]
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct MirEnumType {
@@ -604,6 +628,16 @@ pub struct MirEnumType {
     pub variant_field_counts: Vec<u32>,
     /// All field types concatenated (use variant_field_counts to split)
     pub all_field_types: Vec<Ptr<TypeObj>>,
+    /// Byte offset of each field within the enum, from rustc's layout
+    /// (parallel to `all_field_types`; split with `variant_field_counts`).
+    /// Variants overlap in Rust's layout, so offsets from different
+    /// variants may coincide. Empty when `total_size == 0` (layout
+    /// unknown: niched / single-variant models).
+    pub all_field_offsets: Vec<u64>,
+    /// Byte offset of the discriminant tag within the enum, from rustc's
+    /// layout. Meaningful only when `total_size > 0`; rustc may place the
+    /// tag after payload bytes, so 0 must not be assumed.
+    pub tag_offset: u64,
     /// Total enum size in bytes from rustc layout (including padding).
     /// 0 means unknown / not memory-faithful; mir-lower then keeps the
     /// plain concatenated `{tag, fields...}` struct as-is.
@@ -636,17 +670,23 @@ impl MirEnumType {
             variants,
             0,
             0,
+            0,
         )
     }
 
     /// Create a new enum type from EnumVariant definitions plus rustc layout
-    /// information (total size and ABI alignment in bytes; 0 = unknown).
+    /// information (tag byte offset, total size and ABI alignment in bytes;
+    /// size/align 0 = unknown). When `total_size > 0`, every variant must
+    /// carry rustc field offsets (`EnumVariant::new_with_offsets`); the
+    /// verifier enforces this.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_with_layout(
         ctx: &mut Context,
         name: String,
         discriminant_ty: Ptr<TypeObj>,
         variant_discriminants: Vec<u64>,
         variants: Vec<EnumVariant>,
+        tag_offset: u64,
         total_size: u64,
         abi_align: u64,
     ) -> TypePtr<Self> {
@@ -654,11 +694,13 @@ impl MirEnumType {
         let mut variant_names = Vec::with_capacity(variants.len());
         let mut variant_field_counts = Vec::with_capacity(variants.len());
         let mut all_field_types = Vec::new();
+        let mut all_field_offsets = Vec::new();
 
         for v in variants {
             variant_names.push(v.name);
             variant_field_counts.push(v.field_types.len() as u32);
             all_field_types.extend(v.field_types);
+            all_field_offsets.extend(v.field_offsets);
         }
 
         Type::register_instance(
@@ -669,6 +711,8 @@ impl MirEnumType {
                 variant_discriminants,
                 variant_field_counts,
                 all_field_types,
+                all_field_offsets,
+                tag_offset,
                 total_size,
                 abi_align,
             },
@@ -716,11 +760,38 @@ impl MirEnumType {
             .sum();
         let field_count = self.variant_field_counts[index] as usize;
         let field_types = self.all_field_types[field_offset..field_offset + field_count].to_vec();
+        let field_offsets = if self.all_field_offsets.is_empty() {
+            vec![]
+        } else {
+            self.all_field_offsets[field_offset..field_offset + field_count].to_vec()
+        };
 
         Some(EnumVariant {
             name: self.variant_names[index].clone(),
             field_types,
+            field_offsets,
         })
+    }
+
+    /// Get the rustc-layout byte offsets of a variant's fields (parallel to
+    /// that variant's field types). `None` when the index is out of range
+    /// or when layout is unknown (`all_field_offsets` empty).
+    pub fn variant_field_offsets(&self, index: usize) -> Option<Vec<u64>> {
+        if index >= self.variant_names.len() || self.all_field_offsets.is_empty() {
+            return None;
+        }
+        let field_offset: usize = self.variant_field_counts[..index]
+            .iter()
+            .map(|&x| x as usize)
+            .sum();
+        let field_count = self.variant_field_counts[index] as usize;
+        Some(self.all_field_offsets[field_offset..field_offset + field_count].to_vec())
+    }
+
+    /// Get the byte offset of the discriminant tag within the enum.
+    /// Meaningful only when `total_size() > 0`.
+    pub fn tag_offset(&self) -> u64 {
+        self.tag_offset
     }
 
     /// Get the index of a variant by name.
@@ -765,6 +836,33 @@ impl Verify for MirEnumType {
                 Location::Unknown,
                 "MirEnumType variant field count must match variant count"
             );
+        }
+        if self.total_size > 0 {
+            // Memory-faithful (Direct-tag) enums must carry one rustc byte
+            // offset per field, and every offset (incl. the tag's) must lie
+            // inside the object. Field/tag SIZES are not known at this
+            // level; the slot-map construction in mir-lower asserts the
+            // stronger offset + size <= total_size invariant.
+            if self.all_field_offsets.len() != self.all_field_types.len() {
+                return verify_err!(
+                    Location::Unknown,
+                    "MirEnumType with known layout must have one field offset per field"
+                );
+            }
+            if self.tag_offset >= self.total_size {
+                return verify_err!(
+                    Location::Unknown,
+                    "MirEnumType tag offset must lie within total_size"
+                );
+            }
+            // `o == total_size` is legal for zero-sized fields, which rustc
+            // may place at the very end of the object.
+            if self.all_field_offsets.iter().any(|&o| o > self.total_size) {
+                return verify_err!(
+                    Location::Unknown,
+                    "MirEnumType field offsets must lie within total_size"
+                );
+            }
         }
         Ok(())
     }

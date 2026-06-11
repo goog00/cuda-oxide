@@ -550,16 +550,20 @@ pub fn translate_type(
                         32
                     };
 
-                    // (discriminant type, total size in bytes, ABI alignment).
-                    // Size/align are 0 ("unknown") except for Direct-tag
-                    // enums, where mir-lower uses them to pad (or loudly
-                    // reject) the concatenated struct model at memory
-                    // boundaries.
-                    let (discriminant_ty, total_size, abi_align): (Ptr<TypeObj>, u64, u64) =
-                        match &layout_shape.variants {
+                    // (discriminant type, tag byte offset, total size in
+                    // bytes, ABI alignment). Size/align are 0 ("unknown")
+                    // except for Direct-tag enums, where mir-lower uses
+                    // them to build the memory-faithful representation.
+                    let (discriminant_ty, tag_offset, total_size, abi_align): (
+                        Ptr<TypeObj>,
+                        u64,
+                        u64,
+                        u64,
+                    ) = match &layout_shape.variants {
                             rustc_public::abi::VariantsShape::Multiple {
                                 tag,
                                 tag_encoding: rustc_public::abi::TagEncoding::Direct,
+                                tag_field,
                                 ..
                             } => {
                                 let primitive = match tag {
@@ -583,8 +587,18 @@ pub fn translate_type(
                                         pliron::builtin::types::Signedness::Unsigned
                                     },
                                 );
+                                // The tag is usually at byte 0, but rustc may
+                                // place it after payload bytes; read its real
+                                // offset via the same lookup constant decoding
+                                // uses (shared `translator::layout` helper).
+                                let tag_offset = crate::translator::layout::enum_tag_offset(
+                                    &layout_shape.fields,
+                                    *tag_field,
+                                    pliron::location::Location::Unknown,
+                                )? as u64;
                                 (
                                     tag_ty.into(),
+                                    tag_offset,
                                     layout_shape.size.bytes() as u64,
                                     layout_shape.abi_align,
                                 )
@@ -608,7 +622,7 @@ pub fn translate_type(
                                     variant_count_bits,
                                     pliron::builtin::types::Signedness::Unsigned,
                                 );
-                                (tag_ty.into(), 0u64, 0u64)
+                                (tag_ty.into(), 0u64, 0u64, 0u64)
                             }
                             rustc_public::abi::VariantsShape::Single { .. } => {
                                 // NOT an error: rustc reports `Single` for
@@ -623,7 +637,7 @@ pub fn translate_type(
                                     variant_count_bits,
                                     pliron::builtin::types::Signedness::Unsigned,
                                 );
-                                (tag_ty.into(), 0u64, 0u64)
+                                (tag_ty.into(), 0u64, 0u64, 0u64)
                             }
                             rustc_public::abi::VariantsShape::Empty => {
                                 // Fully uninhabited enums (e.g. `Infallible`)
@@ -642,7 +656,7 @@ pub fn translate_type(
                                     variant_count_bits,
                                     pliron::builtin::types::Signedness::Unsigned,
                                 );
-                                (tag_ty.into(), 0u64, 0u64)
+                                (tag_ty.into(), 0u64, 0u64, 0u64)
                             }
                         };
 
@@ -663,9 +677,13 @@ pub fn translate_type(
                         variant_discriminants.push(discr_val);
                     }
 
-                    // Translate each variant
+                    // Translate each variant. For memory-faithful (Direct
+                    // tag) enums, also record every field's byte offset
+                    // from rustc's layout, via the same shared helper that
+                    // constant decoding uses; variants OVERLAP in that
+                    // layout, so offsets from different variants coincide.
                     let mut enum_variants = Vec::with_capacity(variants.len());
-                    for variant in variants.iter() {
+                    for (variant_idx, variant) in variants.iter().enumerate() {
                         let fields = variant.fields();
                         let mut field_types = Vec::with_capacity(fields.len());
                         for field in fields {
@@ -673,8 +691,25 @@ pub fn translate_type(
                             let translated_ty = translate_type(ctx, &field_ty)?;
                             field_types.push(translated_ty);
                         }
-                        enum_variants
-                            .push(EnumVariant::new(variant.name().to_string(), field_types));
+                        if total_size > 0 {
+                            let field_offsets: Vec<u64> =
+                                crate::translator::layout::enum_variant_field_offsets(
+                                    &layout_shape,
+                                    variant_idx,
+                                    pliron::location::Location::Unknown,
+                                )?
+                                .into_iter()
+                                .map(|o| o as u64)
+                                .collect();
+                            enum_variants.push(EnumVariant::new_with_offsets(
+                                variant.name().to_string(),
+                                field_types,
+                                field_offsets,
+                            ));
+                        } else {
+                            enum_variants
+                                .push(EnumVariant::new(variant.name().to_string(), field_types));
+                        }
                     }
 
                     // Create the enum type
@@ -684,6 +719,7 @@ pub fn translate_type(
                         discriminant_ty,
                         variant_discriminants,
                         enum_variants,
+                        tag_offset,
                         total_size,
                         abi_align,
                     )

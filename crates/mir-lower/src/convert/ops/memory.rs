@@ -938,6 +938,7 @@ mod tests {
             tag_ty,
             discriminants,
             variants,
+            0, // tag at byte 0, like every shape these tests exercise
             total_size,
             abi_align,
         )
@@ -992,7 +993,7 @@ mod tests {
             "OnePayload",
             8,
             vec![
-                EnumVariant::new("A".to_string(), vec![i64_payload]),
+                EnumVariant::new_with_offsets("A".to_string(), vec![i64_payload], vec![8]),
                 EnumVariant::unit("B".to_string()),
             ],
             16,
@@ -1019,8 +1020,8 @@ mod tests {
             "MultiPayload",
             32,
             vec![
-                EnumVariant::new("A".to_string(), vec![i32_a]),
-                EnumVariant::new("B".to_string(), vec![i32_b]),
+                EnumVariant::new_with_offsets("A".to_string(), vec![i32_a], vec![4]),
+                EnumVariant::new_with_offsets("B".to_string(), vec![i32_b], vec![4]),
             ],
             8,
             4,
