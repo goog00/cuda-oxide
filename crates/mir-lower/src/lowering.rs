@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! `dialect-mir` → `dialect-llvm` function lowering via `inline_region`.
+//! `dialect-mir` → LLVM dialect function lowering via `inline_region`.
 //!
 //! This module implements [`convert_func`] — the entry point for lowering
 //! `MirFuncOp` → `llvm.func` using pliron's `DialectConversion` framework.
@@ -29,12 +29,13 @@
 
 use crate::context::{DynamicSmemAlignmentMap, SharedGlobalsMap};
 use crate::convert::types::{
-    convert_function_type, convert_type, is_kernel_func, is_zero_sized_type,
+    StructLayoutInfo, build_struct_slot_map, convert_function_type, convert_type, is_kernel_func,
+    is_zero_sized_type,
 };
 
-use dialect_llvm::ops as llvm;
 use dialect_mir::ops::MirFuncOp;
-use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
+use dialect_mir::types::{MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType};
+use llvm_export::ops as llvm;
 use pliron::{
     basic_block::BasicBlock,
     builtin::op_interfaces::SymbolOpInterface,
@@ -48,7 +49,7 @@ use pliron::{
     op::Op,
     operation::Operation,
     result::Result,
-    r#type::TypeObj,
+    r#type::{TypeObj, Typed},
     value::Value,
 };
 
@@ -58,7 +59,7 @@ use pliron::{
 
 /// Convert a `MirFuncOp` to `llvm.func` using pliron's `inline_region`.
 ///
-/// Called from [`crate::MirToLlvmConversionDriver::rewrite`] when the
+/// Called from `crate::MirToLlvmConversionDriver::rewrite` when the
 /// framework encounters a `MirFuncOp`. Creates a new LLVM function,
 /// propagates kernel attributes, moves the MIR body via `inline_region`,
 /// and builds an entry prologue to reconstruct aggregate arguments.
@@ -79,6 +80,40 @@ pub fn convert_func(
     let is_kernel = is_kernel_func(ctx, op);
 
     let func_type = mir_func.get_type(ctx);
+
+    // Kernel parameters cross the host/device ABI boundary: the host lays
+    // them out with rustc's real layout (by value via cuLaunchKernel, or
+    // behind pointers/slices into DeviceBuffer memory). A multi-payload
+    // enum whose concatenated lowering model is larger than rustc's layout
+    // would make host and device disagree on stride and field offsets, so
+    // reject it here, at the boundary. Device-local use of the same enum
+    // (locals, construct, match) is self-consistent and stays allowed.
+    if is_kernel {
+        let mir_arg_types = {
+            use pliron::builtin::type_interfaces::FunctionTypeInterface;
+            let ft_ref = func_type.deref(ctx);
+            ft_ref.arg_types().to_vec()
+        };
+        for (i, arg_ty) in mir_arg_types.iter().enumerate() {
+            let mut visited = Vec::new();
+            if let Some(enum_name) =
+                crate::convert::types::find_divergent_enum_in_abi(ctx, *arg_ty, &mut visited)
+                    .map_err(anyhow_to_pliron)?
+            {
+                return pliron::input_err_noloc!(
+                    "kernel `{}` parameter {} carries enum `{}` across the host/device ABI \
+                     boundary, but its multi-payload memory layout is not yet field-faithful \
+                     (variants overlap in Rust but are concatenated in the lowering model), so \
+                     host and device would disagree on its size and field offsets. Device-local \
+                     use of `{}` (locals, construct, match) is unaffected.",
+                    func_name_str,
+                    i,
+                    enum_name,
+                    enum_name
+                );
+            }
+        }
+    }
     let llvm_func_type =
         convert_function_type(ctx, func_type, is_kernel).map_err(anyhow_to_pliron)?;
 
@@ -98,6 +133,11 @@ pub fn convert_func(
         // Must happen BEFORE inline_region empties the MIR region.
         let mir_blocks: Vec<_> = mir_region.deref(ctx).iter(ctx).collect();
         let max_align = compute_max_dynamic_smem_alignment(ctx, &mir_blocks);
+
+        // Stamp ABI alignment onto load/store/alloca/ref ops while types are
+        // still MIR — repr(align(N)) is visible on MirStructType but lost after
+        // type conversion (LLVM struct types carry no over-alignment).
+        stamp_memory_op_alignment(ctx, &mir_blocks);
 
         if let Some(align) = max_align {
             let symbol_name: pliron::identifier::Identifier =
@@ -365,7 +405,14 @@ fn reconstruct_slice(
 
 /// Reconstruct a struct value from flattened field values.
 ///
-/// Generates: `undef → insertvalue field0[0] → insertvalue field1[1] → ...`.
+/// `field_vals` carries the flattened args in memory order with ZST fields
+/// skipped (the same walk `convert_function_type` for the callee signature
+/// and `flatten_arguments` at call sites use). Each value is inserted at the LLVM
+/// slot [`build_struct_slot_map`] assigned to its field, so reconstruction
+/// skips `[N x i8]` padding slots instead of inserting into them
+/// (issue #128).
+///
+/// Generates: `undef → insertvalue field[slot] → ...`.
 /// Returns the final reconstructed value and the last inserted operation.
 fn reconstruct_struct(
     ctx: &mut Context,
@@ -374,21 +421,45 @@ fn reconstruct_struct(
     mir_ty: Ptr<TypeObj>,
     field_vals: &[Value],
 ) -> std::result::Result<(Value, Ptr<Operation>), anyhow::Error> {
-    let struct_ty = convert_type(ctx, mir_ty)?;
+    let layout = {
+        let ty_ref = mir_ty.deref(ctx);
+        match ty_ref.downcast_ref::<MirStructType>() {
+            Some(s) => StructLayoutInfo::of_struct(s),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "reconstruct_struct: expected a MirStructType argument"
+                ));
+            }
+        }
+    };
+    let map = build_struct_slot_map(ctx, &layout)?;
 
-    let undef = llvm::UndefOp::new(ctx, struct_ty);
+    let undef = llvm::UndefOp::new(ctx, map.llvm_struct_ty);
     let undef_op = undef.get_operation();
     insert_op_sequentially(undef_op, llvm_block, prev_op, ctx);
     let mut current_struct = undef_op.deref(ctx).get_result(0);
     let mut last_op = undef_op;
 
-    for (field_idx, field_val) in field_vals.iter().enumerate() {
-        let insert_field =
-            llvm::InsertValueOp::new(ctx, current_struct, *field_val, vec![field_idx as u32]);
+    let mut vals = field_vals.iter();
+    for &decl_idx in &layout.mem_to_decl {
+        let Some(slot) = map.decl_to_llvm[decl_idx] else {
+            continue; // ZST field: never flattened into an arg.
+        };
+        let Some(field_val) = vals.next() else {
+            return Err(anyhow::anyhow!(
+                "reconstruct_struct: fewer flattened args than non-ZST struct fields"
+            ));
+        };
+        let insert_field = llvm::InsertValueOp::new(ctx, current_struct, *field_val, vec![slot]);
         let insert_op = insert_field.get_operation();
         insert_op.insert_after(ctx, last_op);
         current_struct = insert_op.deref(ctx).get_result(0);
         last_op = insert_op;
+    }
+    if vals.next().is_some() {
+        return Err(anyhow::anyhow!(
+            "reconstruct_struct: more flattened args than non-ZST struct fields"
+        ));
     }
 
     Ok((current_struct, last_op))
@@ -454,6 +525,72 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
         pliron::result::ErrorKind::VerificationFailed,
         pliron::result::StringError(e.to_string())
     )
+}
+
+// ============================================================================
+// Alignment Pre-Pass
+// ============================================================================
+
+/// Returns the over-alignment (bytes) carried by `ty` if it is a
+/// `MirStructType` with a known `repr(align)`-raised alignment, else `None`.
+fn struct_over_align(ctx: &Context, ty: Ptr<TypeObj>) -> Option<u64> {
+    ty.deref(ctx)
+        .downcast_ref::<MirStructType>()
+        .map(|s| s.abi_align)
+        .filter(|a| *a > 0)
+}
+
+/// Stamp the true ABI alignment onto every `mir.load`, `mir.store`,
+/// `mir.alloca`, and `mir.ref` whose accessed/allocated type carries a
+/// `repr(align(N))` raise in `MirStructType.abi_align`.
+///
+/// Must run BEFORE `inline_region` moves the blocks and BEFORE dialect
+/// conversion replaces MIR types with LLVM types, since the alignment
+/// information lives on `MirStructType` and is not expressible on LLVM
+/// struct types.
+fn stamp_memory_op_alignment(ctx: &mut Context, mir_blocks: &[Ptr<BasicBlock>]) {
+    let load_id = dialect_mir::ops::MirLoadOp::get_opid_static();
+    let store_id = dialect_mir::ops::MirStoreOp::get_opid_static();
+    let alloca_id = dialect_mir::ops::MirAllocaOp::get_opid_static();
+    let ref_id = dialect_mir::ops::MirRefOp::get_opid_static();
+
+    // Collect (op, align) first (read-only pass), then stamp (write pass).
+    let mut to_stamp: Vec<(Ptr<Operation>, u64)> = Vec::new();
+    for mir_block in mir_blocks {
+        let ops: Vec<_> = mir_block.deref(ctx).iter(ctx).collect();
+        for op in ops {
+            let op_id = Operation::get_opid(op, ctx);
+            let align = if op_id == load_id {
+                // load: result(0) is the loaded value.
+                struct_over_align(ctx, op.deref(ctx).get_result(0).get_type(ctx))
+            } else if op_id == store_id {
+                // store: operand(1) is the stored value.
+                struct_over_align(ctx, op.deref(ctx).get_operand(1).get_type(ctx))
+            } else if op_id == alloca_id {
+                // alloca: pointee type lives inside the MirPtrType result.
+                let res_ty = op.deref(ctx).get_result(0).get_type(ctx);
+                res_ty
+                    .deref(ctx)
+                    .downcast_ref::<MirPtrType>()
+                    .map(|p| p.pointee)
+                    .and_then(|pointee| struct_over_align(ctx, pointee))
+            } else if op_id == ref_id {
+                // ref: operand(0) is the value being referenced (spilled to
+                // stack). If it is an over-aligned struct, the synthesised
+                // alloca+store in convert_ref must honour that alignment.
+                struct_over_align(ctx, op.deref(ctx).get_operand(0).get_type(ctx))
+            } else {
+                None
+            };
+            if let Some(a) = align {
+                to_stamp.push((op, a));
+            }
+        }
+    }
+
+    for (op, align) in to_stamp {
+        llvm_export::ops::set_op_alignment(ctx, op, align as u32);
+    }
 }
 
 // ============================================================================

@@ -17,7 +17,7 @@
 //! # The cooperative launch contract
 //!
 //! [`sync`] is **only valid in cooperative kernel launches**. The host must
-//! call [`cuda_core::launch_kernel_cooperative`] (or use
+//! call `cuda_core::launch_kernel_cooperative` (or use
 //! `cuda_launch! { cooperative: true, ... }`); a normal launch deadlocks
 //! because not every block is guaranteed to be co-resident on the GPU and
 //! the driver does not populate the per-launch grid workspace pointer.

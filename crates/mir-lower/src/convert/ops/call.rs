@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Call operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Call operation conversion: `dialect-mir` → LLVM dialect.
 //!
 //! Handles function call lowering with ABI-level transformations:
 //! - Slice arguments flattened to (ptr, len) pairs
@@ -62,15 +62,16 @@
 //! mismatch.
 
 use crate::convert::types::{
-    convert_function_type, convert_type, is_kernel_func, is_zero_sized_type,
+    StructLayoutInfo, build_struct_slot_map, convert_function_type, convert_type, is_kernel_func,
 };
 use crate::helpers;
-use dialect_llvm::op_interfaces::CastOpInterface;
-use dialect_llvm::ops as llvm;
-use dialect_llvm::types as llvm_types;
 use dialect_mir::ops::{MirCallOp, MirFuncOp};
 use dialect_mir::rust_intrinsics;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType, MirTupleType};
+use llvm_export::op_interfaces::CastOpInterface;
+use llvm_export::ops as llvm;
+use llvm_export::types as llvm_types;
+use llvm_export::types::PointerTypeExt;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::op_interfaces::{CallOpCallable, SymbolOpInterface};
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
@@ -827,10 +828,7 @@ fn flatten_arguments(
 
         enum FlattenKind {
             Slice,
-            Struct {
-                field_types: Vec<Ptr<TypeObj>>,
-                mem_to_decl: Vec<usize>,
-            },
+            Struct { layout: StructLayoutInfo },
             None,
         }
 
@@ -840,8 +838,7 @@ fn flatten_arguments(
                 FlattenKind::Slice
             } else if let Some(struct_ty) = ty_ref.downcast_ref::<MirStructType>() {
                 FlattenKind::Struct {
-                    field_types: struct_ty.field_types.clone(),
-                    mem_to_decl: struct_ty.memory_order(),
+                    layout: StructLayoutInfo::of_struct(struct_ty),
                 }
             } else {
                 FlattenKind::None
@@ -883,19 +880,19 @@ fn flatten_arguments(
                 flattened_args.push(len_val);
                 flattened_arg_types.push(len_ty);
             }
-            FlattenKind::Struct {
-                field_types,
-                mem_to_decl,
-            } => {
-                let mut llvm_idx = 0u32;
-                for mem_idx in 0..field_types.len() {
-                    let decl_idx = mem_to_decl[mem_idx];
-                    let llvm_field_ty =
-                        convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
-                    if is_zero_sized_type(ctx, llvm_field_ty) {
-                        continue;
-                    }
-                    let extract_op = llvm::ExtractValueOp::new(ctx, *arg, vec![llvm_idx])?;
+            FlattenKind::Struct { layout } => {
+                // Walk in memory order (the order `convert_function_type`
+                // flattens params in), extracting each non-ZST field from
+                // the slot the type converter placed it in, NOT from a
+                // running non-ZST count, which would land on `[N x i8]`
+                // padding slots for padded structs (issue #128).
+                let map = build_struct_slot_map(ctx, &layout).map_err(anyhow_to_pliron)?;
+                for &decl_idx in &layout.mem_to_decl {
+                    let Some(slot) = map.decl_to_llvm[decl_idx] else {
+                        continue; // ZST field: not passed.
+                    };
+                    let llvm_field_ty = map.field_llvm_types[decl_idx];
+                    let extract_op = llvm::ExtractValueOp::new(ctx, *arg, vec![slot])?;
                     rewriter.insert_operation(ctx, extract_op.get_operation());
                     let field_val = extract_op.get_operation().deref(ctx).get_result(0);
 
@@ -908,7 +905,6 @@ fn flatten_arguments(
                     )?;
                     flattened_args.push(field_val);
                     flattened_arg_types.push(field_ty);
-                    llvm_idx += 1;
                 }
             }
             FlattenKind::None => {
@@ -961,7 +957,8 @@ fn coerce_arg_to_param_ty(
         if let (Some(src_as), Some(dst_as)) = (arg_addrspace, expected_addrspace)
             && src_as != dst_as
         {
-            let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, dst_as);
+            let cast_ty = llvm_types::PointerType::get(ctx, dst_as).into();
+            let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, cast_ty);
             rewriter.insert_operation(ctx, cast_op.get_operation());
             let casted_val = cast_op.get_operation().deref(ctx).get_result(0);
             return Ok((casted_val, expected_ty));
@@ -974,7 +971,8 @@ fn coerce_arg_to_param_ty(
     if let Some(addrspace) = arg_addrspace
         && addrspace != ADDRSPACE_GENERIC
     {
-        let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, ADDRSPACE_GENERIC);
+        let cast_ty = llvm_types::PointerType::get(ctx, ADDRSPACE_GENERIC).into();
+        let cast_op = llvm::AddrSpaceCastOp::new(ctx, arg, cast_ty);
         rewriter.insert_operation(ctx, cast_op.get_operation());
         let casted_val = cast_op.get_operation().deref(ctx).get_result(0);
         let generic_ptr_ty = llvm_types::PointerType::get_generic(ctx);

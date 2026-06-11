@@ -26,8 +26,8 @@
 //! - [`translate_rvalue`]: Main entry point for rvalue translation
 //! - [`translate_operand`]: Translates operands (Copy/Move/Constant/RuntimeChecks)
 //! - [`translate_place`]: Translates places to their SSA values (handles ghost locals)
-//! - [`translate_constant`]: Translates MIR constants to `dialect-mir`
-//! - [`create_ghost_enum_default`]: Synthesises a placeholder for never-assigned enum locals
+//! - `translate_constant`: Translates MIR constants to `dialect-mir`
+//! - `create_ghost_enum_default`: Synthesises a placeholder for never-assigned enum locals
 
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
@@ -36,10 +36,10 @@ use dialect_mir::attributes::MirCastKindAttr;
 use dialect_mir::attributes::MirFP16Attr;
 use dialect_mir::ops::{
     MirAddOp, MirBitAndOp, MirBitOrOp, MirBitXorOp, MirCastOp, MirCheckedAddOp, MirCheckedMulOp,
-    MirCheckedSubOp, MirConstructArrayOp, MirConstructEnumOp, MirConstructStructOp, MirDivOp,
-    MirEqOp, MirExtractFieldOp, MirGeOp, MirGlobalAllocOp, MirGtOp, MirLeOp, MirLoadOp, MirLtOp,
-    MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRefOp, MirRemOp, MirShlOp, MirShrOp,
-    MirSubOp,
+    MirCheckedSubOp, MirCmpOp, MirConstructArrayOp, MirConstructEnumOp, MirConstructStructOp,
+    MirDivOp, MirEqOp, MirExtractFieldOp, MirGeOp, MirGlobalAllocOp, MirGtOp, MirLeOp, MirLoadOp,
+    MirLtOp, MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRefOp, MirRemOp, MirShlOp,
+    MirShrOp, MirSubOp,
 };
 use dialect_mir::types::MirFP16Type;
 use pliron::basic_block::BasicBlock;
@@ -383,6 +383,37 @@ pub fn translate_rvalue(
                     MirNeOp::get_concrete_op_info(),
                     types::get_bool_type(ctx).to_ptr(),
                 ),
+                // Three-way comparison (`Ord::cmp`) - returns
+                // `core::cmp::Ordering`. rustc's `BinOp::ty` knows the
+                // result type of every binop (including `Cmp`, for which it
+                // returns the `Ordering` enum), so derive it locally from
+                // the operand types instead of threading the assignment
+                // destination type through every translate_rvalue caller.
+                mir::BinOp::Cmp => {
+                    let left_ty = left.ty(body.locals()).map_err(|e| {
+                        pliron::input_error!(
+                            loc.clone(),
+                            TranslationErr::unsupported(format!(
+                                "Failed to resolve BinOp::Cmp lhs type: {:?}",
+                                e
+                            ))
+                        )
+                    })?;
+                    let right_ty = right.ty(body.locals()).map_err(|e| {
+                        pliron::input_error!(
+                            loc.clone(),
+                            TranslationErr::unsupported(format!(
+                                "Failed to resolve BinOp::Cmp rhs type: {:?}",
+                                e
+                            ))
+                        )
+                    })?;
+                    let ordering_ty = bin_op.ty(left_ty, right_ty);
+                    (
+                        MirCmpOp::get_concrete_op_info(),
+                        types::translate_type(ctx, &ordering_ty)?,
+                    )
+                }
 
                 // Pointer offset - ptr.add(n) returns ptr + n * sizeof(element)
                 mir::BinOp::Offset => (
@@ -403,16 +434,6 @@ pub fn translate_rvalue(
                 mir::BinOp::BitAnd => (MirBitAndOp::get_concrete_op_info(), left_val.get_type(ctx)),
                 mir::BinOp::BitOr => (MirBitOrOp::get_concrete_op_info(), left_val.get_type(ctx)),
                 mir::BinOp::BitXor => (MirBitXorOp::get_concrete_op_info(), left_val.get_type(ctx)),
-
-                _ => {
-                    return input_err!(
-                        loc,
-                        TranslationErr::unsupported(format!(
-                            "BinaryOp {:?} not yet implemented",
-                            bin_op
-                        ))
-                    );
-                }
             };
 
             let op = Operation::new(
@@ -693,178 +714,30 @@ pub fn translate_rvalue(
         mir::Rvalue::Ref(_region, borrow_kind, place) => {
             // Ref creates a reference to a place: &place or &mut place.
             //
-            // Cases handled below:
+            // Strategy:
             //
-            // 1. `&(*ptr)` — reborrow of a pointer: return `ptr` directly.
-            // 2. `&place.field` (and similar projections) — compute the
-            //    field / element address off the base local's slot.
-            // 3. `&local` / `&mut local` — return the local's alloca slot
-            //    pointer directly. No extra allocation is needed because the
-            //    local already lives in its slot; `mem2reg` can still promote
-            //    the slot if the resulting borrow doesn't escape.
+            // 1. `&local` / `&mut local` -- return the local's alloca slot
+            //    pointer directly (ZST locals get a synthesised pointer).
+            // 2. Any projected place -- compute the real in-memory address
+            //    by walking the FULL projection list from the base local's
+            //    slot via `translate_place_address`: `&(*ptr)` loads the
+            //    pointer, `&(*ptr).field` adds a `mir.field_addr`,
+            //    `&x.arr[i]` adds a `mir.array_element_addr`, and arbitrary
+            //    combinations compose. Borrows produced this way ALIAS the
+            //    original storage, which is what Rust requires: e.g.
+            //    `Enumerate::next` takes `&mut (*_1).0` and `Iter::next`
+            //    must advance the ORIGINAL Iter in place -- a `mir.ref` of
+            //    an extracted field VALUE would mutate a copy and loop
+            //    forever.
+            // 3. Only when no address can be computed (slot-less computed
+            //    value, or a projection the walker cannot lower, e.g.
+            //    Downcast) do we fall back to materialising the VALUE and
+            //    wrapping it in `mir.ref` (fresh slot + store of a COPY).
+            //    That is sound for shared borrows (reads through a copy)
+            //    and a silent miscompile for mutable ones (writes land in
+            //    the copy), so mutable borrows hard-error instead.
 
-            // Case 1: For Ref(*ptr), just want the pointer itself - no load needed.
-            // This is because &*ptr = ptr in terms of address.
-            if place.projection.len() == 1
-                && let mir::ProjectionElem::Deref = &place.projection[0]
-            {
-                // For &(*ptr), just return ptr directly without loading
-                let base_place = mir::Place {
-                    local: place.local,
-                    projection: vec![],
-                };
-                let (base_val, last_inserted) =
-                    translate_place(ctx, body, &base_place, value_map, block_ptr, prev_op, loc)?;
-                return Ok((None, base_val, last_inserted));
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Case 2: &(*ptr).field - Reference to nested struct field
-            // ═══════════════════════════════════════════════════════════════════════
-            //
-            // CRITICAL FIX: When taking a reference to a field through a pointer,
-            // we must compute the ADDRESS of the field, not copy its value.
-            //
-            // Example: Enumerate::next() calling Iter::next()
-            //
-            //   MIR: _5 = &mut ((*_1).0: I)   // Take reference to field 0 of *_1
-            //
-            //   ┌─────────────────────────────────────────────────────────────┐
-            //   │ Enumerate struct at *_1                                     │
-            //   │ ┌─────────────────────────────────────────────────────────┐ │
-            //   │ │ .0: Iter { ptr: 0x1000, end: 0x1010 }  ← NEED ADDRESS  │ │
-            //   │ └─────────────────────────────────────────────────────────┘ │
-            //   │ .1: count = 0                                               │
-            //   └─────────────────────────────────────────────────────────────┘
-            //
-            //   WRONG (old approach with mir.ref):
-            //     1. Load struct from _1         → { Iter, count }
-            //     2. Extract field 0             → Iter (VALUE)
-            //     3. mir.ref(Iter)               → alloca, store COPY, return ptr
-            //     Result: Iter::next modifies the COPY, original unchanged!
-            //             → Infinite loop (iterator never advances)
-            //
-            //   CORRECT (new approach with mir.field_addr):
-            //     1. mir.field_addr(_1, 0)       → ptr to .0 INSIDE original struct
-            //     Result: Iter::next modifies the ORIGINAL Iter
-            //             → Iterator advances correctly
-            //
-            // Pattern: Deref followed by Field projection(s)
-            // ═══════════════════════════════════════════════════════════════════════
-            if place.projection.len() >= 2
-                && let mir::ProjectionElem::Deref = &place.projection[0]
-                && let mir::ProjectionElem::Field(field_idx, field_ty) = &place.projection[1]
-            {
-                // Get the base pointer (the local variable holding the pointer)
-                let base_place = mir::Place {
-                    local: place.local,
-                    projection: vec![],
-                };
-                let (ptr_val, mut last_inserted) = translate_place(
-                    ctx,
-                    body,
-                    &base_place,
-                    value_map,
-                    block_ptr,
-                    prev_op,
-                    loc.clone(),
-                )?;
-
-                // Get the field type
-                let field_type = super::types::translate_type(ctx, field_ty)?;
-
-                // Determine if this is a mutable reference
-                let is_mutable = matches!(borrow_kind, mir::BorrowKind::Mut { .. });
-
-                // Create result pointer type
-                let result_ptr_ty =
-                    dialect_mir::types::MirPtrType::get_generic(ctx, field_type, is_mutable);
-
-                use dialect_mir::ops::MirFieldAddrOp;
-                let field_addr_op = Operation::new(
-                    ctx,
-                    MirFieldAddrOp::get_concrete_op_info(),
-                    vec![result_ptr_ty.into()],
-                    vec![ptr_val],
-                    vec![],
-                    0,
-                );
-                field_addr_op.deref_mut(ctx).set_loc(loc.clone());
-
-                let mir_field_addr_op = MirFieldAddrOp::new(field_addr_op);
-                mir_field_addr_op.set_attr_field_index(
-                    ctx,
-                    dialect_mir::attributes::FieldIndexAttr(*field_idx as u32),
-                );
-
-                // Insert the operation
-                if let Some(prev) = last_inserted {
-                    field_addr_op.insert_after(ctx, prev);
-                } else if let Some(prev) = prev_op {
-                    field_addr_op.insert_after(ctx, prev);
-                } else {
-                    field_addr_op.insert_at_front(block_ptr, ctx);
-                }
-                last_inserted = Some(field_addr_op);
-
-                // Get the result value
-                let mut result_val = field_addr_op.deref(ctx).get_result(0);
-
-                // Handle additional projections after the first field
-                // e.g., &(*ptr).field1.field2
-                if place.projection.len() > 2 {
-                    for proj in &place.projection[2..] {
-                        match proj {
-                            mir::ProjectionElem::Field(nested_field_idx, nested_field_ty) => {
-                                // Get the nested field type
-                                let nested_field_type =
-                                    super::types::translate_type(ctx, nested_field_ty)?;
-
-                                // Create result pointer type for nested field
-                                let nested_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
-                                    ctx,
-                                    nested_field_type,
-                                    is_mutable,
-                                );
-
-                                let nested_field_addr_op = Operation::new(
-                                    ctx,
-                                    MirFieldAddrOp::get_concrete_op_info(),
-                                    vec![nested_ptr_ty.into()],
-                                    vec![result_val],
-                                    vec![],
-                                    0,
-                                );
-                                nested_field_addr_op.deref_mut(ctx).set_loc(loc.clone());
-
-                                let mir_nested_op = MirFieldAddrOp::new(nested_field_addr_op);
-                                mir_nested_op.set_attr_field_index(
-                                    ctx,
-                                    dialect_mir::attributes::FieldIndexAttr(
-                                        *nested_field_idx as u32,
-                                    ),
-                                );
-
-                                if let Some(prev) = last_inserted {
-                                    nested_field_addr_op.insert_after(ctx, prev);
-                                }
-                                last_inserted = Some(nested_field_addr_op);
-                                result_val = nested_field_addr_op.deref(ctx).get_result(0);
-                            }
-                            _ => {
-                                // For other projections (Index, etc.), fall through to general case
-                                // This is a simplification - complex paths like &(*ptr).field[i]
-                                // would need more handling
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                return Ok((None, result_val, last_inserted));
-            }
-
-            // Case 3: bare local reference `&local` / `&mut local`.
+            // Case 1: bare local reference `&local` / `&mut local`.
             //
             // Alloca + load/store model: every non-ZST MIR local is backed by
             // a stack slot emitted at the top of the entry block. Taking the
@@ -923,32 +796,48 @@ pub fn translate_rvalue(
                 return Ok((None, result_val, Some(ref_op)));
             }
 
-            // Case 4: `&local.field` / `&local[i]` -- compute the in-memory
-            // address from the local's slot instead of materialising an
-            // SSA-value copy.
-            //
-            // This is the "correct-refs" path: we lean on the alloca slot
-            // rather than `MirRefOp`, so a caller mutating through the
-            // reference affects the original local.
-            if let Some(slot) = value_map.get_slot(place.local)
-                && let Some((result_val, last_inserted)) = translate_place_addr_from_slot(
-                    ctx,
-                    slot,
-                    &place.projection,
-                    is_mutable,
-                    block_ptr,
-                    prev_op,
-                    loc.clone(),
-                )?
-            {
+            // Case 2: unified address path -- walk the full projection list
+            // (`Deref`, `Field`, `Index`, `ConstantIndex`) from the base
+            // local's alloca slot. This is the "correct-refs" path: the
+            // resulting pointer addresses the ORIGINAL storage, so writes
+            // through the borrow mutate the borrowed place.
+            if let Some((result_val, last_inserted)) = translate_place_address(
+                ctx,
+                body,
+                value_map,
+                place,
+                is_mutable,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            )? {
                 return Ok((None, result_val, last_inserted));
             }
 
-            // Case 5: Fallback -- reference to a computed value that has no
-            // backing slot (e.g. the result of an rvalue expression). Emit
-            // `mir.ref` which allocates a fresh slot, stores the value, and
-            // returns the pointer. This path is rare now that every local has
-            // its own slot.
+            // No address could be computed. The only remaining strategy is
+            // the value-copy fallback below, which is a silent miscompile
+            // for mutable borrows: writes through the borrow would land in
+            // the copy and the original place would never change. Refuse
+            // loudly instead of emitting wrong code.
+            if is_mutable {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "Rvalue::Ref: cannot compute an in-memory address for the mutable \
+                         borrow of place {:?} (projection {:?}); the value-copy fallback \
+                         would silently discard writes through the borrow",
+                        place, place.projection
+                    ))
+                );
+            }
+
+            // Case 3: shared-borrow fallback -- reference to a computed
+            // value that has no backing slot (e.g. the result of an rvalue
+            // expression) or whose projection the address walker cannot
+            // lower (e.g. enum Downcast, issues #131/#146). Emit `mir.ref`
+            // which allocates a fresh slot, stores a COPY of the value, and
+            // returns the pointer. Sound for shared borrows only (reads);
+            // mutable borrows were rejected above.
             let (val, last_inserted) =
                 translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?;
 
@@ -970,121 +859,60 @@ pub fn translate_rvalue(
             Ok((Some(ref_op), result_val, last_inserted))
         }
         mir::Rvalue::AddressOf(mutability, place) => {
-            // AddressOf creates a raw pointer to a place: &raw const place or &raw mut place.
-            // For AddressOf(*ptr), we just want the pointer itself - no load needed.
-            // For other places, we must materialize an address (mir.ref or mir.field_addr).
+            // AddressOf creates a raw pointer to a place: `&raw const place`
+            // / `&raw mut place` (also `core::ptr::addr_of!`). Raw pointers
+            // have the same aliasing requirement as references: the pointer
+            // must address the ORIGINAL place, so this routes through the
+            // same unified address walker as `Rvalue::Ref` (which also gives
+            // raw pointers the runtime-Index / ConstantIndex handling).
+            let is_mutable = matches!(mutability, mir::RawPtrKind::Mut);
 
-            // Check if the place is a simple Deref: *local
-            if place.projection.len() == 1
-                && let mir::ProjectionElem::Deref = &place.projection[0]
+            // Bare local: the alloca slot IS the address.
+            if place.projection.is_empty()
+                && let Some(slot) = value_map.get_slot(place.local)
             {
-                // For &raw mut (*ptr) or &raw const (*ptr), just return ptr directly
-                let base_place = mir::Place {
-                    local: place.local,
-                    projection: vec![],
-                };
-                let (base_val, last_inserted) =
-                    translate_place(ctx, body, &base_place, value_map, block_ptr, prev_op, loc)?;
-                return Ok((None, base_val, last_inserted));
+                return Ok((None, slot, prev_op));
             }
 
-            // Pattern: Deref followed by Field projection(s) - compute field address
-            if place.projection.len() >= 2
-                && let mir::ProjectionElem::Deref = &place.projection[0]
-                && let mir::ProjectionElem::Field(field_idx, field_ty) = &place.projection[1]
-            {
-                let base_place = mir::Place {
-                    local: place.local,
-                    projection: vec![],
-                };
-                let (ptr_val, mut last_inserted) = translate_place(
-                    ctx,
-                    body,
-                    &base_place,
-                    value_map,
-                    block_ptr,
-                    prev_op,
-                    loc.clone(),
-                )?;
-
-                let field_type = super::types::translate_type(ctx, field_ty)?;
-                let is_mutable = matches!(mutability, mir::RawPtrKind::Mut);
-                let result_ptr_ty =
-                    dialect_mir::types::MirPtrType::get_generic(ctx, field_type, is_mutable);
-
-                use dialect_mir::ops::MirFieldAddrOp;
-                let field_addr_op = Operation::new(
-                    ctx,
-                    MirFieldAddrOp::get_concrete_op_info(),
-                    vec![result_ptr_ty.into()],
-                    vec![ptr_val],
-                    vec![],
-                    0,
-                );
-                field_addr_op.deref_mut(ctx).set_loc(loc.clone());
-
-                let mir_field_addr_op = MirFieldAddrOp::new(field_addr_op);
-                mir_field_addr_op.set_attr_field_index(
-                    ctx,
-                    dialect_mir::attributes::FieldIndexAttr(*field_idx as u32),
-                );
-
-                if let Some(prev) = last_inserted {
-                    field_addr_op.insert_after(ctx, prev);
-                } else if let Some(prev) = prev_op {
-                    field_addr_op.insert_after(ctx, prev);
-                } else {
-                    field_addr_op.insert_at_front(block_ptr, ctx);
-                }
-                last_inserted = Some(field_addr_op);
-
-                let mut result_val = field_addr_op.deref(ctx).get_result(0);
-
-                if place.projection.len() > 2 {
-                    for proj in &place.projection[2..] {
-                        if let mir::ProjectionElem::Field(nested_field_idx, nested_field_ty) = proj
-                        {
-                            let nested_field_type =
-                                super::types::translate_type(ctx, nested_field_ty)?;
-                            let nested_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
-                                ctx,
-                                nested_field_type,
-                                is_mutable,
-                            );
-                            let nested_field_addr_op = Operation::new(
-                                ctx,
-                                MirFieldAddrOp::get_concrete_op_info(),
-                                vec![nested_ptr_ty.into()],
-                                vec![result_val],
-                                vec![],
-                                0,
-                            );
-                            nested_field_addr_op.deref_mut(ctx).set_loc(loc.clone());
-                            let mir_nested_op = MirFieldAddrOp::new(nested_field_addr_op);
-                            mir_nested_op.set_attr_field_index(
-                                ctx,
-                                dialect_mir::attributes::FieldIndexAttr(*nested_field_idx as u32),
-                            );
-
-                            if let Some(prev) = last_inserted {
-                                nested_field_addr_op.insert_after(ctx, prev);
-                            }
-                            last_inserted = Some(nested_field_addr_op);
-                            result_val = nested_field_addr_op.deref(ctx).get_result(0);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
+            // Unified address path: full projection walk from the slot
+            // (`&raw (*ptr)` loads the pointer, `&raw (*ptr).field[i]`
+            // composes field + element addresses, ...).
+            if let Some((result_val, last_inserted)) = translate_place_address(
+                ctx,
+                body,
+                value_map,
+                place,
+                is_mutable,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            )? {
                 return Ok((None, result_val, last_inserted));
             }
 
-            // For other places, translate to a value and materialize an address.
+            // No address could be computed. The value-copy fallback below
+            // returns a pointer to a COPY, so writes through a `&raw mut`
+            // would be silently lost -- refuse loudly. Exception: a bare
+            // slot-less local is a ZST (no bytes), so a copy cannot lose
+            // writes; let it use the fallback for both mutabilities, the
+            // same way `Rvalue::Ref` synthesises ZST borrows.
+            if is_mutable && !place.projection.is_empty() {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "Rvalue::AddressOf: cannot compute an in-memory address for \
+                         `&raw mut` of place {:?} (projection {:?}); the value-copy \
+                         fallback would silently discard writes through the pointer",
+                        place, place.projection
+                    ))
+                );
+            }
+
+            // Shared (or bare-ZST) fallback: translate to a value and
+            // materialize an address of a copy.
             let (val, last_inserted) =
                 translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?;
 
-            let is_mutable = matches!(mutability, mir::RawPtrKind::Mut);
             let val_ty = val.get_type(ctx);
             let ptr_ty = dialect_mir::types::MirPtrType::get_generic(ctx, val_ty, is_mutable);
 
@@ -2111,10 +1939,19 @@ pub fn translate_operand(
                 .is::<dialect_mir::types::MirPtrType>()
             {
                 // Pointer type constant - could be:
-                // 1. A raw pointer constant (like core::ptr::null()) - just bytes
-                // 2. A reference to a constant struct (like &(8..16)) - need struct + mir.ref
+                // 1. A raw pointer constant (like core::ptr::null()) - just bytes,
+                //    no provenance
+                // 2. A reference to a constant struct (like &(8..16)) - need
+                //    struct + mir.ref
+                // 3. A reference to any other promoted constant (like the `&77`
+                //    that -O const-folds out of `Option<&u32>::unwrap_or(&77)`,
+                //    issue #132) - follow the allocation provenance, materialize
+                //    the pointee constant, then mir.ref
                 //
-                // Distinguish by checking if the pointee is a struct and has non-null data
+                // Only constants WITHOUT provenance may take the raw-pointer
+                // path; a provenance entry always names a real allocation, and
+                // ignoring it would lower the reference to `inttoptr 0` (a null
+                // pointer).
 
                 // Extract pointer type info before further borrows
                 let (pointee_ty, is_mutable, pointee_is_struct) = {
@@ -2206,9 +2043,153 @@ pub fn translate_operand(
                     return Ok((ptr_val, Some(mir_ref.get_operation())));
                 }
 
-                // Raw pointer constant (like core::ptr::null())
-                // Create an integer constant with the pointer value (0 for null),
-                // then convert it to a pointer type using MirCastOp
+                // Reference to a non-struct promoted constant (issue #132).
+                //
+                // Under -O, MIR const-folds e.g. the `None` arm of
+                // `Option<&u32>::unwrap_or(&77)` into a constant of type `&u32`
+                // whose data bytes are a pointer placeholder and whose
+                // provenance entry names the allocation holding the literal
+                // `77`. Struct pointees were already handled above; follow the
+                // provenance for every other pointee type too, materialize the
+                // pointee through the shared constant-from-bytes path, and take
+                // its address with mir.ref (mem2reg/lowering turn that into an
+                // alloca + store + address; sound because promoted constants
+                // are immutable).
+                let backing_alloc: Option<&rustc_public::ty::Allocation> =
+                    match constant.const_.kind() {
+                        ConstantKind::Allocated(alloc) => Some(alloc),
+                        ConstantKind::Ty(ty_const) => match ty_const.kind() {
+                            rustc_public::ty::TyConstKind::Value(_, alloc) => Some(alloc),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+
+                if let Some(alloc) = backing_alloc
+                    && let Some(&(prov_pos, prov)) = alloc.provenance.ptrs.first()
+                {
+                    use rustc_public::mir::alloc::GlobalAlloc;
+                    let alloc_id = prov.0;
+
+                    // The pointer's own data bytes encode the byte offset into
+                    // the target allocation (zero for plain promoted literals
+                    // like `&77`). The struct/array provenance branches assume
+                    // offset zero; here the slice below honors a non-zero
+                    // offset, and an unreadable offset is a hard error rather
+                    // than a silently wrong address.
+                    let ptr_width =
+                        rustc_public::target::MachineInfo::target_pointer_width().bytes();
+                    let target_offset = alloc
+                        .read_partial_uint(prov_pos..prov_pos + ptr_width)
+                        .map_err(|e| {
+                            input_error_noloc!(TranslationErr::unsupported(format!(
+                                "Failed to read pointer constant provenance offset: {:?}",
+                                e
+                            )))
+                        })? as usize;
+
+                    let target_bytes: Vec<u8> = match GlobalAlloc::from(alloc_id) {
+                        GlobalAlloc::Memory(target_alloc) => {
+                            target_alloc.raw_bytes().ok().unwrap_or_else(|| {
+                                target_alloc
+                                    .bytes
+                                    .iter()
+                                    .map(|opt: &Option<u8>| opt.unwrap_or(0))
+                                    .collect::<Vec<u8>>()
+                            })
+                        }
+                        GlobalAlloc::Static(static_def) => {
+                            let target_alloc = static_def.eval_initializer().map_err(|e| {
+                                input_error_noloc!(TranslationErr::unsupported(format!(
+                                    "Failed to evaluate static initializer for pointer constant: {:?}",
+                                    e
+                                )))
+                            })?;
+                            target_alloc.raw_bytes().ok().unwrap_or_else(|| {
+                                target_alloc
+                                    .bytes
+                                    .iter()
+                                    .map(|opt: &Option<u8>| opt.unwrap_or(0))
+                                    .collect::<Vec<u8>>()
+                            })
+                        }
+                        other => {
+                            return input_err!(
+                                loc,
+                                TranslationErr::unsupported(format!(
+                                    "Pointer constant provenance points to non-memory allocation: {:?}",
+                                    other
+                                ))
+                            );
+                        }
+                    };
+
+                    if target_offset > target_bytes.len() {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Pointer constant provenance offset {} exceeds target allocation size {}",
+                                target_offset,
+                                target_bytes.len()
+                            ))
+                        );
+                    }
+
+                    // The shared materializer needs the pointee's Rust type for
+                    // enum-layout queries and ZST detection.
+                    let Some((pointee_rust_ty, _)) = get_static_pointer_info(&rust_ty) else {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Pointer constant with provenance has unsupported Rust type: {:?}",
+                                rust_ty
+                            ))
+                        );
+                    };
+
+                    let (pointee_val, last_op) = translate_constant_value_from_bytes(
+                        ctx,
+                        &pointee_rust_ty,
+                        pointee_ty,
+                        &target_bytes[target_offset..],
+                        block_ptr,
+                        prev_op,
+                        loc.clone(),
+                    )?;
+
+                    // Take the address of the materialized value, exactly like
+                    // the struct branch above.
+                    let ref_op = Operation::new(
+                        ctx,
+                        MirRefOp::get_concrete_op_info(),
+                        vec![const_ty_ptr], // Result is pointer to the pointee
+                        vec![pointee_val],  // Operand is the materialized value
+                        vec![],
+                        0,
+                    );
+                    ref_op.deref_mut(ctx).set_loc(loc);
+
+                    let mir_ref = MirRefOp::new(ref_op);
+                    mir_ref
+                        .set_attr_mutable(ctx, dialect_mir::attributes::MutabilityAttr(is_mutable));
+
+                    if let Some(prev) = last_op {
+                        mir_ref.get_operation().insert_after(ctx, prev);
+                    } else {
+                        mir_ref.get_operation().insert_at_front(block_ptr, ctx);
+                    }
+
+                    let ptr_val = mir_ref.get_operation().deref(ctx).get_result(0);
+                    return Ok((ptr_val, Some(mir_ref.get_operation())));
+                }
+
+                // Raw pointer constant (like core::ptr::null()).
+                //
+                // Only reachable for constants WITHOUT provenance (true null or
+                // int-to-ptr values); provenance-carrying constants returned
+                // above. Create an integer constant with the pointer value
+                // (0 for null), then convert it to a pointer type using
+                // MirCastOp
                 use dialect_mir::ops::MirCastOp;
 
                 // Parse the pointer value from the constant bytes (typically all zeros for null)
@@ -2418,7 +2399,7 @@ pub fn translate_operand(
 ///
 /// When such a local is still *used* within a block (e.g. `discriminant(_6)`)
 /// and happens to be an enum, we synthesise a variant-0 default via
-/// [`create_ghost_enum_default`]. Non-enum ghost locals currently produce an
+/// `create_ghost_enum_default`. Non-enum ghost locals currently produce an
 /// error -- extend this match if new patterns appear in future toolchains.
 ///
 /// This is the SSA equivalent of rustc's codegen reading an uninitialized
@@ -3154,6 +3135,47 @@ fn apply_enum_field_projection(
     Ok((payload_value, Some(payload_op.get_operation())))
 }
 
+/// Compute the in-memory address of `place` by walking its FULL projection
+/// list starting from `place.local`'s alloca slot.
+///
+/// Single entry point for `Rvalue::Ref` / `Rvalue::AddressOf` address
+/// materialisation: `&(*ptr)` loads the pointer, `&(*ptr).field` adds a
+/// field address, `&x.arr[i]` adds an element address, and arbitrary
+/// combinations compose.
+///
+/// Returns `Ok(None)` when the local has no slot (ZST / ghost locals) or
+/// when the projection chain contains an element
+/// [`translate_place_addr_from_slot`] cannot lower. The caller decides
+/// whether a value-copy fallback is sound (shared borrows: reads through a
+/// copy are fine) or the construct must be rejected (mutable borrows / raw
+/// mut pointers: writes through a copy are silently lost).
+#[allow(clippy::too_many_arguments)]
+fn translate_place_address(
+    ctx: &mut Context,
+    body: &mir::Body,
+    value_map: &ValueMap,
+    place: &mir::Place,
+    is_mutable: bool,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<Option<(Value, Option<Ptr<Operation>>)>> {
+    let Some(slot) = value_map.get_slot(place.local) else {
+        return Ok(None);
+    };
+    translate_place_addr_from_slot(
+        ctx,
+        body,
+        value_map,
+        slot,
+        &place.projection,
+        is_mutable,
+        block_ptr,
+        prev_op,
+        loc,
+    )
+}
+
 /// Compute the in-memory address of `place` starting from its alloca `slot`.
 ///
 /// Walks the projection chain and emits the correct pliron ops for each
@@ -3162,19 +3184,27 @@ fn apply_enum_field_projection(
 /// - `Field(idx, _)`   → [`MirFieldAddrOp`]
 /// - `ConstantIndex {offset, from_end: false, ..}` → `MirConstantOp` + [`MirArrayElementAddrOp`]
 /// - `Index(local)`    → `load_local(local)` + [`MirArrayElementAddrOp`]
-/// - `Deref`           → load the pointer; subsequent projections apply to
-///   the pointee.
+/// - `Deref`           → `MirLoadOp` of the pointer (the loaded pointer IS
+///   the pointee's address); subsequent projections apply to the pointee.
+///   ZST pointees skip the load (SharedArray exception) and fat
+///   (slice-shaped) pointees are never walked through -- see the arm.
+///
+/// `Downcast` (enum payload addressing; issues #131/#146), `Subslice` and
+/// from-end `ConstantIndex` are NOT handled; the walker punts on them
+/// (returns `Ok(None)`).
 ///
 /// Returns `Ok(Some((addr, last_op)))` on success, `Ok(None)` if the
 /// projection chain contains an element this helper doesn't know how to
-/// turn into an address (the caller falls back to `MirRefOp`), or `Err` if
-/// something structurally invalid happens (wrong pointee kind, unsupported
-/// type).
+/// turn into an address (the caller decides whether a value fallback is
+/// sound or the construct must be rejected), or `Err` if something
+/// structurally invalid happens (wrong pointee kind, unsupported type).
 ///
 /// `is_mutable` governs the mutability of intermediate pointer types; the
 /// final result pointer also carries this mutability.
 fn translate_place_addr_from_slot(
     ctx: &mut Context,
+    body: &mir::Body,
+    value_map: &ValueMap,
     slot: Value,
     projection: &[mir::ProjectionElem],
     is_mutable: bool,
@@ -3187,8 +3217,97 @@ fn translate_place_addr_from_slot(
     let mut current = slot;
     let mut current_prev_op = prev_op;
 
-    for elem in projection {
+    for (proj_idx, elem) in projection.iter().enumerate() {
         match elem {
+            // `*place` -- the place walked so far holds a pointer; the
+            // address of the dereferenced place is that pointer VALUE, so a
+            // single `mir.load` of `current` yields it. Subsequent
+            // projections then apply to the pointee.
+            mir::ProjectionElem::Deref => {
+                // Type of the place being dereferenced (= pointee of the
+                // `current` address).
+                let place_ty = {
+                    let ty = current.get_type(ctx);
+                    let ty_ref = ty.deref(ctx);
+                    match ty_ref.downcast_ref::<dialect_mir::types::MirPtrType>() {
+                        Some(pt) => pt.pointee,
+                        // `current` is not a pointer-typed address; punt to
+                        // the caller.
+                        None => return Ok(None),
+                    }
+                };
+                let (pointee_is_zst_tuple, pointee_is_thin_ptr, pointee_is_fat) = {
+                    let p_ref = place_ty.deref(ctx);
+                    let is_zst_tuple = p_ref
+                        .downcast_ref::<dialect_mir::types::MirTupleType>()
+                        .is_some_and(|tt| tt.get_types().is_empty());
+                    let is_thin_ptr = p_ref.is::<dialect_mir::types::MirPtrType>();
+                    let is_fat = p_ref.is::<dialect_mir::types::MirSliceType>()
+                        || p_ref.is::<dialect_mir::types::MirDisjointSliceType>();
+                    (is_zst_tuple, is_thin_ptr, is_fat)
+                };
+
+                if pointee_is_zst_tuple {
+                    // ZST-pointee no-load exception (mirrors the Deref
+                    // handling in `translate_place`, where it covers
+                    // SharedArray): a pointer to a ZST *is* the runtime
+                    // representation of the ZST place, so the deref adds no
+                    // indirection. Keep `current` unchanged instead of
+                    // emitting a meaningless load.
+                    continue;
+                }
+
+                let is_last = proj_idx + 1 == projection.len();
+                if pointee_is_fat {
+                    // Slice-shaped places (`&[T]`, `DisjointSlice<T>`)
+                    // scalarize to (ptr, len). Dereferencing THROUGH them
+                    // with a single `mir.load` would treat the fat value as
+                    // a thin address -- a silent miscompile -- so we never
+                    // continue the walk into a fat pointee.
+                    if is_last {
+                        // Trailing `&*s` reborrow: the borrow result IS the
+                        // fat value, which lives whole in the slot, so a
+                        // load of the slot is exactly right (and is what
+                        // the pre-unification reborrow case emitted).
+                    } else if is_mutable {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "cannot compute a mutable in-memory address through \
+                                 fat-pointer deref (projection {:?}); slices scalarize \
+                                 to (ptr, len) and a single load would misread the \
+                                 fat value as a thin address",
+                                projection
+                            ))
+                        );
+                    } else {
+                        // Shared borrow: let the caller fall back to a value
+                        // copy, which is sound for reads.
+                        return Ok(None);
+                    }
+                } else if !pointee_is_thin_ptr {
+                    // Deref of a non-pointer-typed place (a type the
+                    // importer models by value); punt to the caller.
+                    return Ok(None);
+                }
+
+                let load_op = Operation::new(
+                    ctx,
+                    MirLoadOp::get_concrete_op_info(),
+                    vec![place_ty],
+                    vec![current],
+                    vec![],
+                    0,
+                );
+                load_op.deref_mut(ctx).set_loc(loc.clone());
+                match current_prev_op {
+                    Some(p) => load_op.insert_after(ctx, p),
+                    None => load_op.insert_at_front(block_ptr, ctx),
+                }
+                current = load_op.deref(ctx).get_result(0);
+                current_prev_op = Some(load_op);
+            }
+
             mir::ProjectionElem::Field(field_idx, field_ty) => {
                 let field_type = types::translate_type(ctx, field_ty)?;
                 let result_ptr_ty =
@@ -3271,10 +3390,69 @@ fn translate_place_addr_from_slot(
                 current_prev_op = Some(addr_op);
             }
 
-            // Remaining projection kinds (Deref, Index(runtime), Downcast,
-            // Subslice, ...) aren't lowered to addresses here yet. Punt to the
-            // caller, which will fall back to materialising a value and
-            // wrapping it in `MirRefOp`.
+            // Runtime `arr[i]` indexing. Without this arm, a place like
+            // `&(*ptr).field[i]` would silently drop the `Index` projection
+            // and return a pointer to the array's first slot, miscompiling
+            // every load through the reference into a load of element 0.
+            mir::ProjectionElem::Index(index_local) => {
+                let (element_ty, addr_space) = match pointer_pointee_kind(ctx, current) {
+                    Some(kind) => kind,
+                    None => return Ok(None),
+                };
+                let element_ty = match element_ty {
+                    PointeeKind::Array(elem_ty) => elem_ty,
+                    PointeeKind::Other => return Ok(None),
+                };
+
+                let index_place = mir::Place {
+                    local: *index_local,
+                    projection: vec![],
+                };
+                let (index_val, next_prev_op) = translate_place(
+                    ctx,
+                    body,
+                    &index_place,
+                    value_map,
+                    block_ptr,
+                    current_prev_op,
+                    loc.clone(),
+                )?;
+                current_prev_op = next_prev_op;
+
+                let elem_ptr_ty =
+                    dialect_mir::types::MirPtrType::get(ctx, element_ty, is_mutable, addr_space)
+                        .into();
+                let addr_op = Operation::new(
+                    ctx,
+                    MirArrayElementAddrOp::get_concrete_op_info(),
+                    vec![elem_ptr_ty],
+                    vec![current, index_val],
+                    vec![],
+                    0,
+                );
+                addr_op.deref_mut(ctx).set_loc(loc.clone());
+                match current_prev_op {
+                    Some(p) => addr_op.insert_after(ctx, p),
+                    None => addr_op.insert_at_front(block_ptr, ctx),
+                }
+                current = addr_op.deref(ctx).get_result(0);
+                current_prev_op = Some(addr_op);
+            }
+
+            // Enum-variant downcast (`(x as Variant).field`). Addressing an
+            // enum payload in memory needs variant/niche layout machinery
+            // (per-variant payload offsets, tag placement) that the importer
+            // currently models only in VALUE space via
+            // `MirExtractEnumPayloadOp`. This arm is the designed extension
+            // point for the enum-layout work tracked in issues #131/#146;
+            // until that lands, punt so shared borrows can fall back to a
+            // value copy and mutable borrows fail loudly at the caller.
+            mir::ProjectionElem::Downcast(_) => return Ok(None),
+
+            // Remaining projection kinds (Subslice, from-end ConstantIndex,
+            // ...) aren't lowered to addresses here yet. Punt to the caller,
+            // which decides between a value fallback (shared borrows) and a
+            // hard error (mutable borrows).
             _ => return Ok(None),
         }
     }
@@ -3353,7 +3531,21 @@ pub fn translate_place_iterative(
             }
         };
 
-    // Track the current Rust type for enum projections
+    // Track the Rust type of `current_value` alongside the pliron value.
+    // Each iteration below advances it through rustc_public's own projection
+    // typing (`ProjectionElem::ty`) AFTER the arm has processed the element,
+    // so every arm observes the type *before* its own projection applies and
+    // the next iteration sees the narrowed type. `Downcast` deliberately
+    // leaves the type unchanged (still the enum ADT), which is exactly what
+    // `apply_enum_field_projection` expects when the following `Field` fires.
+    //
+    // This single fold is the only place `current_rust_ty` is updated;
+    // individual arms must not update it themselves. Per-arm updates were
+    // the cause of issue #131: only `Field` advanced the type, so chains
+    // like `[Index, Downcast, Field]` (from `match xs[i]` over an array of
+    // enums) handed the stale Array type to the Downcast/Field handler,
+    // which bailed with "Downcast on non-ADT type: Array". The same
+    // staleness affected `Deref` and `ConstantIndex`.
     let mut current_rust_ty = body.locals()[local].ty;
 
     // Track pending downcast (Downcast is a no-op, but we need variant info for Field on enums)
@@ -3401,7 +3593,6 @@ pub fn translate_place_iterative(
                         loc.clone(),
                     )?;
                 }
-                current_rust_ty = *field_ty;
             }
 
             ProjectionElem::Downcast(variant_idx) => {
@@ -3712,6 +3903,21 @@ pub fn translate_place_iterative(
                 );
             }
         }
+
+        // Advance the running Rust type with rustc_public's own projection
+        // typing (single source of truth; see the comment on
+        // `current_rust_ty` above). For well-formed MIR this never fails;
+        // if it does, surface the projection element and the type it was
+        // applied to so the bail-out is actionable.
+        current_rust_ty = projection.ty(current_rust_ty).map_err(|e| {
+            input_error!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "Failed to type projection {:?} applied to {:?}: {:?}",
+                    projection, current_rust_ty, e
+                ))
+            )
+        })?;
     }
 
     Ok((current_value, current_prev_op))
@@ -5448,8 +5654,38 @@ fn enum_variant_index_from_bytes(
 
             match tag_encoding {
                 rustc_public::abi::TagEncoding::Direct => {
-                    Ok(discriminant_to_variant_index(rust_ty, tag_value as usize)
-                        .unwrap_or(tag_value as usize))
+                    // The tag bytes hold a declared discriminant VALUE
+                    // truncated to the PHYSICAL tag width; the caller wants
+                    // a variant INDEX. `discriminant_for_variant().val` is
+                    // at the declared discriminant type's width (isize for
+                    // default-repr enums), so the comparison must mask both
+                    // sides to the tag width (`Neg::N = -5` is byte 0xFB in
+                    // an i8 tag but 0xFFFF_FFFF_FFFF_FFFB as isize). A tag
+                    // that matches no declared discriminant means we
+                    // misread the constant; falling back to
+                    // "value == index" would silently conflate the two
+                    // semantics (the issue #146 bug class).
+                    let primitive = match tag {
+                        rustc_public::abi::Scalar::Initialized { value, .. }
+                        | rustc_public::abi::Scalar::Union { value } => *value,
+                    };
+                    let scalar_size = primitive.size(&rustc_public::target::MachineInfo::target());
+                    let mask = scalar_size.unsigned_int_max().ok_or_else(|| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Enum tag width {} exceeds 128 bits",
+                            scalar_size.bits()
+                        )))
+                    })?;
+
+                    discriminant_to_variant_index(rust_ty, tag_value, mask).ok_or_else(|| {
+                        input_error!(
+                            loc.clone(),
+                            TranslationErr::unsupported(format!(
+                                "Enum constant tag value {} matches no declared discriminant",
+                                tag_value
+                            ))
+                        )
+                    })
                 }
                 rustc_public::abi::TagEncoding::Niche {
                     untagged_variant,
@@ -5714,10 +5950,18 @@ fn read_uint_from_bytes(bytes: &[u8]) -> u128 {
 /// - Variant index: position in the enum (0, 1, 2, ...)
 /// - Discriminant: the explicit or implicit value assigned to each variant
 ///
+/// `tag_value` is the raw tag read from memory, i.e. the discriminant
+/// truncated to the PHYSICAL tag width, while `discriminant_for_variant`
+/// reports values at the declared discriminant type's width (isize for
+/// default-repr enums). `mask` is the tag width's unsigned max; both
+/// sides are masked to it so negative discriminants compare correctly
+/// (`-5` is `0xFB` in an i8 tag but `0xFFFF_FFFF_FFFF_FFFB` as isize).
+///
 /// This function iterates through variants to find which one has the given discriminant.
 fn discriminant_to_variant_index(
     rust_ty: &rustc_public::ty::Ty,
-    discriminant_value: usize,
+    tag_value: u128,
+    mask: u128,
 ) -> Option<usize> {
     use rustc_public::ty::{RigidTy, TyKind};
 
@@ -5726,11 +5970,10 @@ fn discriminant_to_variant_index(
             for (idx, _variant_def) in adt_def.variants().iter().enumerate() {
                 let variant_idx = rustc_public::ty::VariantIdx::to_val(idx);
                 let discr = adt_def.discriminant_for_variant(variant_idx);
-                if discr.val as usize == discriminant_value {
+                if discr.val & mask == tag_value & mask {
                     return Some(idx);
                 }
             }
-            // If not found, the discriminant might equal the index (common case)
             None
         }
         _ => None,

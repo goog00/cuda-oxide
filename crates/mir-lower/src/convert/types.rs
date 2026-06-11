@@ -3,21 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Type conversion from `dialect-mir` types to `dialect-llvm` types.
+//! Type conversion from `dialect-mir` types to LLVM dialect types.
 //!
 //! This module handles the translation of `dialect-mir` type representations
-//! to their `dialect-llvm` equivalents. Type conversion is foundational to
+//! to their LLVM dialect equivalents. Type conversion is foundational to
 //! the lowering pass—most operation converters depend on it.
 //!
 //! # Overview
 //!
 //! `dialect-mir` types are high-level, Rust-like types that preserve semantic
-//! information (signedness, slice semantics, etc.). `dialect-llvm` types are
+//! information (signedness, slice semantics, etc.). LLVM dialect types are
 //! lower-level and match LLVM IR types directly.
 //!
 //! # Type Mapping Table
 //!
-//! | `dialect-mir` Type              | `dialect-llvm` Type               | Notes                       |
+//! | `dialect-mir` Type              | LLVM dialect Type                 | Notes                       |
 //! |---------------------------------|-----------------------------------|-----------------------------|
 //! | `IntegerType` (signed/unsigned) | `IntegerType` (signless)          | Width preserved             |
 //! | `MirFP16Type`                   | `HalfType`                        | Rust `f16` → LLVM `half`    |
@@ -67,14 +67,21 @@
 //!
 //! # Enum Type Representation
 //!
-//! Rust enums are represented as structs with discriminant + payload:
+//! Rust enums are represented as structs with the discriminant tag first,
+//! then every variant's payload fields concatenated in declaration order:
 //!
 //! ```text
-//! MIR: MirEnumType { discriminant: i8, variants: [A(), B(i32)] }
-//! LLVM: struct { i8, i32 }  ; discriminant + max payload size
+//! MIR: MirEnumType { discriminant: i8, discriminants: [0, 1], variants: [A(), B(i32)] }
+//! LLVM: struct { i8, i32 }  ; tag + concatenated variant fields
 //! ```
 //!
-//! All variant payloads are included in the struct, sized for the largest.
+//! The discriminant type is rustc's layout-truth tag (width and
+//! signedness), and the tag slot stores the variant's DECLARED
+//! discriminant value from `discriminants`, not its variant index.
+//! When rustc's total size is known (Direct-tag enums), the struct is padded
+//! with a trailing `[N x i8]` to match it; multi-payload enums whose
+//! concatenation exceeds rustc's size are rejected at the kernel ABI boundary.
+//! See `convert_enum_to_llvm` in this module.
 //!
 //! # Function Type Conversion
 //!
@@ -86,8 +93,11 @@
 //!
 //! This matches the C ABI for GPU kernels.
 
-use dialect_llvm::types as llvm_types;
-use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType};
+use dialect_mir::types::{
+    MirDisjointSliceType, MirEnumType, MirSliceType, MirStructType, MirTupleType,
+};
+use llvm_export::types as llvm_types;
+use llvm_export::types::PointerTypeExt;
 use pliron::builtin::type_interfaces::FunctionTypeInterface;
 use pliron::builtin::types::{FP32Type, FP64Type, FunctionType, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -165,7 +175,7 @@ pub fn is_zero_sized_type(ctx: &Context, ty: Ptr<TypeObj>) -> bool {
 // Type Conversion
 // =============================================================================
 
-/// Convert a `dialect-mir` type to its `dialect-llvm` equivalent.
+/// Convert a `dialect-mir` type to its LLVM dialect equivalent.
 ///
 /// Dispatches via `MirTypeConversion` type interface — each supported type
 /// registers a converter function pointer through `#[type_interface_impl]`
@@ -362,84 +372,181 @@ pub fn convert_function_type(
     Ok(llvm_types::FuncType::get(ctx, ret_ty, inputs, false))
 }
 
-/// Build an LLVM struct with explicit padding to match rustc's exact layout.
+// =============================================================================
+// Struct Slot Mapping (single source of truth, issue #128)
+// =============================================================================
+
+/// Declaration-order layout facts for one MIR aggregate, in the exact form
+/// [`build_struct_slot_map`] consumes.
 ///
-/// This ensures perfect ABI compatibility between host and device by using
-/// padding arrays `[N x i8]` to place fields at their exact offsets.
+/// Extracting this owned carrier first (and dropping the `Ref` returned by
+/// `Ptr::deref`) keeps the borrow checker happy: the slot-map build needs
+/// `&mut Context` for type interning.
+pub(crate) struct StructLayoutInfo {
+    /// Field types in declaration order.
+    pub field_types: Vec<Ptr<TypeObj>>,
+    /// Memory order: `mem_to_decl[mem_idx] = decl_idx`. Always full length
+    /// (identity when rustc did not reorder).
+    pub mem_to_decl: Vec<usize>,
+    /// Byte offset of each field in declaration order; empty when rustc
+    /// layout is unknown.
+    pub field_offsets: Vec<u64>,
+    /// Total size in bytes including trailing padding; 0 when unknown.
+    pub total_size: u64,
+}
+
+impl StructLayoutInfo {
+    /// Layout facts of a `MirStructType`.
+    pub(crate) fn of_struct(s: &MirStructType) -> Self {
+        StructLayoutInfo {
+            field_types: s.field_types.clone(),
+            mem_to_decl: s.memory_order(),
+            field_offsets: s.field_offsets().to_vec(),
+            total_size: s.total_size(),
+        }
+    }
+
+    /// Layout facts of a `MirTupleType`: identity order, no rustc layout.
+    pub(crate) fn of_tuple(t: &MirTupleType) -> Self {
+        let field_types = t.get_types().to_vec();
+        let mem_to_decl = (0..field_types.len()).collect();
+        StructLayoutInfo {
+            field_types,
+            mem_to_decl,
+            field_offsets: vec![],
+            total_size: 0,
+        }
+    }
+}
+
+/// One lowered LLVM struct plus the value-level slot mapping into it.
 ///
-/// # Why This Matters
+/// [`build_struct_slot_map`] produces the struct type and the index map in
+/// the same walk, so every op that indexes into the struct (`insertvalue`,
+/// `extractvalue`, GEP, call-boundary flatten/reconstruct) shares the type
+/// converter's view of where each field landed. Computing the indices
+/// separately is how the issue #128 class of bug (indices that ignore the
+/// `[N x i8]` padding slots) happened.
+pub(crate) struct StructSlotMap {
+    /// The final LLVM struct type, including any `[N x i8]` padding slots.
+    pub llvm_struct_ty: Ptr<TypeObj>,
+    /// `decl_to_llvm[decl_idx]` = LLVM slot of that declaration-order field;
+    /// `None` when the field is zero-sized and was stripped.
+    pub decl_to_llvm: Vec<Option<u32>>,
+    /// Converted LLVM type of each declaration-order field (ZSTs included).
+    pub field_llvm_types: Vec<Ptr<TypeObj>>,
+}
+
+/// Lower a struct/tuple layout to its LLVM struct type and slot map.
 ///
-/// LLVM's datalayout string controls how it computes struct field offsets.
-/// If the host uses different alignment rules than our datalayout, the struct
-/// layout would differ. By using explicit padding, we match rustc's layout
-/// exactly, regardless of LLVM's datalayout.
+/// When rustc layout is present (`field_offsets` non-empty and
+/// `total_size > 0`), fields are placed at their exact byte offsets with
+/// explicit `[N x i8]` padding slots in between, plus a trailing pad up to
+/// `total_size`. This makes the layout independent of LLVM's datalayout
+/// and so ABI-identical to what rustc computed on the host. For
+/// `struct Extreme { a: u8, b: i128 }` where rustc puts `b` at offset 0
+/// and `a` at offset 16 with total size 32, we build:
 ///
-/// # Example
-///
-/// For `struct Extreme { a: u8, b: i128 }` where rustc computes:
-/// - field `b` at offset 0 (16 bytes)
-/// - field `a` at offset 16 (1 byte)
-/// - total size: 32 bytes (aligned to 16)
-///
-/// We generate:
 /// ```text
-/// { i128, i8, [15 x i8] }  ; b at 0, a at 16, padding to 32
+/// { i128, i8, [15 x i8] }   ; slots:  b = 0, a = 1, pad = 2
 /// ```
 ///
-/// # Arguments
+/// Without rustc layout, fields are emitted in memory order with no
+/// padding. On both paths zero-sized fields (e.g. `PhantomData`) are
+/// stripped, because NVPTX rejects empty types; stripped fields get
+/// `None` in `decl_to_llvm`.
 ///
-/// * `ctx` - The pliron context
-/// * `field_types` - Field types in declaration order
-/// * `mem_to_decl` - Memory order: mem_to_decl[mem_idx] = decl_idx
-/// * `field_offsets` - Byte offset of each field in declaration order
-/// * `total_size` - Total struct size in bytes
-pub(crate) fn build_struct_with_explicit_padding(
+/// Malformed layout metadata (a `mem_to_decl` that is not a permutation,
+/// or an offsets vector of the wrong length) is rejected loudly: guessing
+/// here would scramble every downstream field access.
+pub(crate) fn build_struct_slot_map(
     ctx: &mut Context,
-    field_types: &[Ptr<TypeObj>],
-    mem_to_decl: &[usize],
-    field_offsets: &[u64],
-    total_size: u64,
-) -> Result<Ptr<TypeObj>, anyhow::Error> {
+    layout: &StructLayoutInfo,
+) -> Result<StructSlotMap, anyhow::Error> {
+    let num_fields = layout.field_types.len();
+
+    if layout.mem_to_decl.len() != num_fields {
+        return Err(anyhow::anyhow!(
+            "struct slot map: memory order has {} entries but the struct has {} fields",
+            layout.mem_to_decl.len(),
+            num_fields
+        ));
+    }
+    let mut seen = vec![false; num_fields];
+    for &decl_idx in &layout.mem_to_decl {
+        if decl_idx >= num_fields || seen[decl_idx] {
+            return Err(anyhow::anyhow!(
+                "struct slot map: memory order {:?} is not a permutation of 0..{}",
+                layout.mem_to_decl,
+                num_fields
+            ));
+        }
+        seen[decl_idx] = true;
+    }
+    let has_explicit_layout = !layout.field_offsets.is_empty() && layout.total_size > 0;
+    if has_explicit_layout && layout.field_offsets.len() != num_fields {
+        return Err(anyhow::anyhow!(
+            "struct slot map: {} field offsets for {} fields",
+            layout.field_offsets.len(),
+            num_fields
+        ));
+    }
+
+    // Convert every field up front, in declaration order.
+    let mut field_llvm_types = Vec::with_capacity(num_fields);
+    for &field_ty in &layout.field_types {
+        field_llvm_types.push(convert_type(ctx, field_ty)?);
+    }
+
     let mut llvm_fields: Vec<Ptr<TypeObj>> = Vec::new();
+    let mut decl_to_llvm: Vec<Option<u32>> = vec![None; num_fields];
     let mut current_offset: u64 = 0;
 
-    // Process fields in memory order
-    for mem_idx in 0..field_types.len() {
-        let decl_idx = mem_to_decl[mem_idx];
-        let field_ty = field_types[decl_idx];
-        let target_offset = field_offsets[decl_idx];
+    // Place fields in memory order.
+    for &decl_idx in &layout.mem_to_decl {
+        let llvm_ty = field_llvm_types[decl_idx];
 
-        // Insert padding if needed to reach the target offset
-        if current_offset < target_offset {
-            let padding_size = target_offset - current_offset;
-            let padding_ty = make_padding_type(ctx, padding_size);
-            llvm_fields.push(padding_ty);
-            current_offset = target_offset;
-        }
-
-        // Convert and add the field
-        let llvm_ty = convert_type(ctx, field_ty)?;
-
-        // Skip ZST fields (PhantomData) - they have no size
+        // ZST fields are stripped: no slot, no offset advance (rustc gives
+        // them size 0).
         if is_zero_sized_type(ctx, llvm_ty) {
             continue;
         }
 
+        if has_explicit_layout {
+            // Insert padding if needed to reach the rustc field offset.
+            let target_offset = layout.field_offsets[decl_idx];
+            if current_offset < target_offset {
+                let padding_ty = make_padding_type(ctx, target_offset - current_offset);
+                llvm_fields.push(padding_ty);
+                current_offset = target_offset;
+            }
+        }
+
+        decl_to_llvm[decl_idx] = Some(llvm_fields.len() as u32);
         llvm_fields.push(llvm_ty);
 
-        // Advance offset by field size
-        let field_size = get_type_size(ctx, llvm_ty);
-        current_offset += field_size;
+        if has_explicit_layout {
+            // Prefer rustc's stored size for the field over the LLVM-level
+            // approximation: nested aggregates carry interior/trailing
+            // padding the converted type cannot always reproduce, and a
+            // wrong advance here either forces interior padding where
+            // rustc has none or overshoots the next field's offset.
+            current_offset += mir_stored_size(ctx, layout.field_types[decl_idx])
+                .unwrap_or_else(|| get_type_size(ctx, llvm_ty));
+        }
     }
 
-    // Add trailing padding to reach total_size
-    if current_offset < total_size {
-        let trailing_padding = total_size - current_offset;
-        let padding_ty = make_padding_type(ctx, trailing_padding);
+    // Add trailing padding to reach total_size.
+    if has_explicit_layout && current_offset < layout.total_size {
+        let padding_ty = make_padding_type(ctx, layout.total_size - current_offset);
         llvm_fields.push(padding_ty);
     }
 
-    Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
+    Ok(StructSlotMap {
+        llvm_struct_ty: llvm_types::StructType::get_unnamed(ctx, llvm_fields).into(),
+        decl_to_llvm,
+        field_llvm_types,
+    })
 }
 
 /// Create a padding type: `[N x i8]` for N bytes of padding.
@@ -448,10 +555,263 @@ fn make_padding_type(ctx: &mut Context, size: u64) -> Ptr<TypeObj> {
     llvm_types::ArrayType::get(ctx, i8_ty.into(), size).into()
 }
 
+/// Size of a MIR-level type from rustc layout truth, when stored.
+///
+/// `MirStructType` and `MirEnumType` carry `total_size` (interior and
+/// trailing padding included) straight from rustc's layout query; arrays
+/// of such aggregates multiply it out. Returns `None` when no stored size
+/// is available (e.g. niched/single-variant enums store 0) and the caller
+/// must fall back to the LLVM-level approximation.
+fn mir_stored_size(ctx: &Context, mir_ty: Ptr<TypeObj>) -> Option<u64> {
+    let ty_ref = mir_ty.deref(ctx);
+    if let Some(s) = ty_ref.downcast_ref::<MirStructType>() {
+        if s.total_size() > 0 {
+            return Some(s.total_size());
+        }
+        return None;
+    }
+    if let Some(e) = ty_ref.downcast_ref::<MirEnumType>() {
+        if e.total_size() > 0 {
+            return Some(e.total_size());
+        }
+        return None;
+    }
+    if let Some(a) = ty_ref.downcast_ref::<dialect_mir::types::MirArrayType>() {
+        let elem_ty = a.element_ty;
+        let size = a.size;
+        return mir_stored_size(ctx, elem_ty).map(|elem_size| elem_size * size);
+    }
+    None
+}
+
+/// LLVM natural-layout `(size, align)` of an exported LLVM type, in bytes.
+///
+/// Mirrors LLVM's default data layout for nvptx64 (scalars align to their
+/// size, arrays to their element, non-packed structs to their widest field).
+/// Unlike [`get_type_size`], which sums struct fields without alignment,
+/// this computes the real allocation size, which is what GEP striding and
+/// the enum size check below need.
+pub(crate) fn llvm_type_size_align(ctx: &Context, ty: Ptr<TypeObj>) -> (u64, u64) {
+    let ty_ref = ty.deref(ctx);
+
+    if let Some(int_ty) = ty_ref.downcast_ref::<IntegerType>() {
+        let size = (int_ty.width() as u64).div_ceil(8);
+        // i8 → 1, i16 → 2, i32 → 4, i64 → 8, i128 → 16.
+        return (size, size.next_power_of_two().min(16));
+    }
+    if ty_ref.is::<llvm_types::HalfType>() {
+        return (2, 2);
+    }
+    if ty_ref.is::<FP32Type>() {
+        return (4, 4);
+    }
+    if ty_ref.is::<FP64Type>() {
+        return (8, 8);
+    }
+    if ty_ref.is::<llvm_types::PointerType>() {
+        return (8, 8);
+    }
+    if let Some(arr_ty) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
+        let (elem_size, elem_align) = llvm_type_size_align(ctx, arr_ty.elem_type());
+        return (elem_size * arr_ty.size(), elem_align.max(1));
+    }
+    if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
+        let fields: Vec<_> = struct_ty.fields().collect();
+        let (_end, size, align) = natural_struct_layout(ctx, &fields);
+        return (size, align);
+    }
+
+    // Vector types and anything unrecognised: conservative 8-byte fallback,
+    // matching get_type_size.
+    (8, 8)
+}
+
+/// Natural (non-packed) LLVM struct layout over `fields`.
+///
+/// Returns `(end, size, align)` where `end` is the unrounded offset just past
+/// the last field, `size` is `end` rounded up to the struct alignment (the
+/// allocation size LLVM uses for GEP striding), and `align` is the widest
+/// field alignment.
+pub(crate) fn natural_struct_layout(ctx: &Context, fields: &[Ptr<TypeObj>]) -> (u64, u64, u64) {
+    let mut end = 0u64;
+    let mut align = 1u64;
+    for field in fields {
+        let (field_size, field_align) = llvm_type_size_align(ctx, *field);
+        let field_align = field_align.max(1);
+        end = end.div_ceil(field_align) * field_align;
+        end += field_size;
+        align = align.max(field_align);
+    }
+    let size = end.div_ceil(align) * align;
+    (end, size, align)
+}
+
+/// Convert a `MirEnumType` to its LLVM struct representation.
+///
+/// The base model is the concatenated struct `{tag, variant fields...}`
+/// (field 0 is the discriminant; every variant's payload fields follow in
+/// declaration order). When rustc's total size is known (`total_size > 0`,
+/// i.e. Direct-tag enums) the structural size is compared against it:
+///
+/// - equal: the concatenated struct already matches; return it unchanged.
+/// - structural < total (trailing shortfall: `repr(align(N))` raises, unit
+///   variants alongside sized payloads elsewhere): append a trailing
+///   `[N x i8]` pad so the LLVM allocation size equals rustc's. Appending at
+///   the END keeps every existing insertvalue/extractvalue index valid; the
+///   pad is simply never written.
+/// - structural > total (multi-payload enums whose variants overlap in Rust
+///   but concatenate in this model, e.g. `#[repr(u32)] enum E { A(u32),
+///   B(u32) }` is 8 bytes in Rust vs 12 structural): padding is impossible,
+///   so the concatenated struct is returned as-is. It stays self-consistent
+///   for ALL device-local use (construct, match, allocas, loads/stores and
+///   GEPs over device-written memory), but payload field OFFSETS remain the
+///   concatenated model, NOT Rust's overlapped layout. Such enums are
+///   therefore rejected at the kernel ABI boundary, where the host side is
+///   laid out with rustc's real layout; see [`enum_memory_divergence`] and
+///   [`find_divergent_enum_in_abi`].
+pub(crate) fn convert_enum_to_llvm(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+) -> Result<Ptr<TypeObj>, anyhow::Error> {
+    let (discriminant_ty, all_field_types, total_size) = {
+        let ty_ref = ty.deref(ctx);
+        let enum_ty = ty_ref
+            .downcast_ref::<MirEnumType>()
+            .ok_or_else(|| anyhow::anyhow!("convert_enum_to_llvm: expected MirEnumType"))?;
+        (
+            enum_ty.discriminant_ty,
+            enum_ty.all_field_types.clone(),
+            enum_ty.total_size(),
+        )
+    };
+
+    let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
+    let mut llvm_fields = vec![llvm_discr_ty];
+    for field_ty in all_field_types {
+        llvm_fields.push(convert_type(ctx, field_ty)?);
+    }
+
+    if total_size > 0 {
+        let (end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
+        if size < total_size {
+            let padding_ty = make_padding_type(ctx, total_size - end);
+            llvm_fields.push(padding_ty);
+        }
+    }
+
+    Ok(llvm_types::StructType::get_unnamed(ctx, llvm_fields).into())
+}
+
+/// Detect Direct-tag enums whose concatenated `{tag, fields...}` model cannot
+/// match rustc's memory layout: the structural size exceeds rustc's total
+/// size because several variants carry payloads that overlap in Rust but are
+/// concatenated in our model. Such an enum cannot be padded into shape, and
+/// traversing memory with it (GEP stride, load/store width) would silently
+/// read or write the wrong bytes, so callers reject it loudly instead.
+///
+/// Returns `Some(enum_name)` for a divergent enum, `None` when `ty` is not a
+/// `MirEnumType` or its layout is memory-faithful (possibly after padding).
+pub(crate) fn enum_memory_divergence(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+) -> Result<Option<String>, anyhow::Error> {
+    let info = {
+        let ty_ref = ty.deref(ctx);
+        ty_ref.downcast_ref::<MirEnumType>().map(|enum_ty| {
+            (
+                enum_ty.name().to_string(),
+                enum_ty.discriminant_ty,
+                enum_ty.all_field_types.clone(),
+                enum_ty.total_size(),
+            )
+        })
+    };
+    let Some((name, discriminant_ty, all_field_types, total_size)) = info else {
+        return Ok(None);
+    };
+    if total_size == 0 {
+        // Size unknown (niched / single-variant model): the un-niched model
+        // is deliberately self-consistent; nothing to check against.
+        return Ok(None);
+    }
+
+    let llvm_discr_ty = convert_type(ctx, discriminant_ty)?;
+    let mut llvm_fields = vec![llvm_discr_ty];
+    for field_ty in all_field_types {
+        llvm_fields.push(convert_type(ctx, field_ty)?);
+    }
+    let (_end, size, _align) = natural_struct_layout(ctx, &llvm_fields);
+
+    Ok((size > total_size).then_some(name))
+}
+
+/// Find a layout-divergent enum reachable from `ty` through the kernel ABI.
+///
+/// Walks the pre-conversion MIR type tree: pointer pointees, slice and
+/// array elements, struct/tuple fields, and enum payload fields. Returns
+/// the first divergent enum's name (see [`enum_memory_divergence`]), or
+/// `None` when the whole tree is memory-faithful.
+///
+/// Used only for KERNEL signatures: a kernel parameter is laid out by the
+/// host with rustc's real layout (by value via `cuLaunchKernel`, or behind
+/// pointers/slices into `DeviceBuffer` memory), so a divergent enum there
+/// means host and device disagree on stride and field offsets. Device-local
+/// use of the same enum (locals, construct, match, loads/stores of allocas)
+/// is self-consistent because every access uses the same lowered struct
+/// type, and is deliberately NOT rejected.
+///
+/// `visited` breaks cycles through recursive types (`Ptr<TypeObj>` is
+/// interned, so equality is identity).
+pub(crate) fn find_divergent_enum_in_abi(
+    ctx: &mut Context,
+    ty: Ptr<TypeObj>,
+    visited: &mut Vec<Ptr<TypeObj>>,
+) -> Result<Option<String>, anyhow::Error> {
+    if visited.contains(&ty) {
+        return Ok(None);
+    }
+    visited.push(ty);
+
+    if let Some(name) = enum_memory_divergence(ctx, ty)? {
+        return Ok(Some(name));
+    }
+
+    let children: Vec<Ptr<TypeObj>> = {
+        let ty_ref = ty.deref(ctx);
+        if let Some(p) = ty_ref.downcast_ref::<dialect_mir::types::MirPtrType>() {
+            vec![p.pointee]
+        } else if let Some(s) = ty_ref.downcast_ref::<MirSliceType>() {
+            vec![s.element_ty]
+        } else if let Some(s) = ty_ref.downcast_ref::<MirDisjointSliceType>() {
+            vec![s.element_ty]
+        } else if let Some(a) = ty_ref.downcast_ref::<dialect_mir::types::MirArrayType>() {
+            vec![a.element_ty]
+        } else if let Some(s) = ty_ref.downcast_ref::<MirStructType>() {
+            s.field_types.clone()
+        } else if let Some(t) = ty_ref.downcast_ref::<MirTupleType>() {
+            t.get_types().to_vec()
+        } else if let Some(e) = ty_ref.downcast_ref::<MirEnumType>() {
+            e.all_field_types.clone()
+        } else {
+            vec![]
+        }
+    };
+
+    for child in children {
+        if let Some(name) = find_divergent_enum_in_abi(ctx, child, visited)? {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 /// Get the size of an LLVM type in bytes (approximate).
 ///
-/// This is used for computing padding. For most types we know the exact size;
-/// for complex types we make reasonable assumptions.
+/// This is used for computing padding. For most types we know the exact
+/// size. For structs the sum of field sizes is exact when the struct was
+/// built with explicit padding (the pads are real fields) but an
+/// approximation otherwise; prefer [`mir_stored_size`] whenever the MIR
+/// type is at hand.
 fn get_type_size(ctx: &Context, ty: Ptr<TypeObj>) -> u64 {
     let ty_ref = ty.deref(ctx);
 
@@ -482,7 +842,8 @@ fn get_type_size(ctx: &Context, ty: Ptr<TypeObj>) -> u64 {
         return elem_size * arr_ty.size();
     }
 
-    // Struct types (sum of field sizes - approximation)
+    // Struct types: sum of field sizes. Exact for explicitly-padded
+    // structs (pads are real [N x i8] fields); an approximation otherwise.
     if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
         return struct_ty.fields().map(|f| get_type_size(ctx, f)).sum();
     }
@@ -527,5 +888,267 @@ pub(crate) fn make_slice_struct(ctx: &mut Context) -> Ptr<TypeObj> {
 
 #[cfg(test)]
 mod tests {
-    // TODO (npasham): Add unit tests for type conversion
+    //! Hardware-free unit tests for [`build_struct_slot_map`]: the slot map
+    //! and the LLVM struct type are produced by the same walk, so these
+    //! tests pin down both for the layout shapes from issue #128.
+
+    use super::*;
+    use dialect_mir::types::{EnumVariant, MirEnumType};
+
+    fn make_ctx() -> Context {
+        let mut ctx = Context::new();
+        dialect_mir::register(&mut ctx);
+        crate::register(&mut ctx);
+        ctx
+    }
+
+    /// A MIR-level unsigned integer type (what the importer produces).
+    fn mir_uint(ctx: &mut Context, width: u32) -> Ptr<TypeObj> {
+        IntegerType::get(ctx, width, Signedness::Unsigned).into()
+    }
+
+    /// A converted (signless) LLVM integer type.
+    fn llvm_int(ctx: &mut Context, width: u32) -> Ptr<TypeObj> {
+        IntegerType::get(ctx, width, Signedness::Signless).into()
+    }
+
+    /// `[n x i8]` padding type, as `make_padding_type` builds it.
+    fn pad(ctx: &mut Context, n: u64) -> Ptr<TypeObj> {
+        make_padding_type(ctx, n)
+    }
+
+    /// A zero-sized MIR struct (PhantomData shape).
+    fn mir_zst(ctx: &mut Context) -> Ptr<TypeObj> {
+        MirStructType::get(ctx, "Phantom".into(), vec![], vec![]).into()
+    }
+
+    fn struct_fields(ctx: &Context, ty: Ptr<TypeObj>) -> Vec<Ptr<TypeObj>> {
+        ty.deref(ctx)
+            .downcast_ref::<llvm_types::StructType>()
+            .expect("expected an LLVM struct type")
+            .fields()
+            .collect()
+    }
+
+    #[test]
+    fn slot_map_reorder_only() {
+        let mut ctx = make_ctx();
+        // struct { a: u8, b: u64 }, memory order [b, a], no rustc offsets.
+        let a = mir_uint(&mut ctx, 8);
+        let b = mir_uint(&mut ctx, 64);
+        let layout = StructLayoutInfo {
+            field_types: vec![a, b],
+            mem_to_decl: vec![1, 0],
+            field_offsets: vec![],
+            total_size: 0,
+        };
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert_eq!(map.decl_to_llvm, vec![Some(1), Some(0)]);
+        let i8s = llvm_int(&mut ctx, 8);
+        let i64s = llvm_int(&mut ctx, 64);
+        assert_eq!(struct_fields(&ctx, map.llvm_struct_ty), vec![i64s, i8s]);
+    }
+
+    #[test]
+    fn slot_map_padding_only() {
+        let mut ctx = make_ctx();
+        // struct { a: u8 @ 0, b: u64 @ 8 }, declaration order == memory
+        // order, size 16: lowers to { i8, [7 x i8], i64 }. The pad consumes
+        // slot 1, so b lands at slot 2 (the issue #128 sites used 1).
+        let a = mir_uint(&mut ctx, 8);
+        let b = mir_uint(&mut ctx, 64);
+        let layout = StructLayoutInfo {
+            field_types: vec![a, b],
+            mem_to_decl: vec![0, 1],
+            field_offsets: vec![0, 8],
+            total_size: 16,
+        };
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert_eq!(map.decl_to_llvm, vec![Some(0), Some(2)]);
+        let i8s = llvm_int(&mut ctx, 8);
+        let i64s = llvm_int(&mut ctx, 64);
+        let pad7 = pad(&mut ctx, 7);
+        assert_eq!(
+            struct_fields(&ctx, map.llvm_struct_ty),
+            vec![i8s, pad7, i64s]
+        );
+    }
+
+    #[test]
+    fn slot_map_reorder_plus_padding() {
+        let mut ctx = make_ctx();
+        // struct { a: u8 @ 8, b: u64 @ 0 }, memory order [b, a], size 16:
+        // lowers to { i64, i8, [7 x i8] } with a trailing pad.
+        let a = mir_uint(&mut ctx, 8);
+        let b = mir_uint(&mut ctx, 64);
+        let layout = StructLayoutInfo {
+            field_types: vec![a, b],
+            mem_to_decl: vec![1, 0],
+            field_offsets: vec![8, 0],
+            total_size: 16,
+        };
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert_eq!(map.decl_to_llvm, vec![Some(1), Some(0)]);
+        let i8s = llvm_int(&mut ctx, 8);
+        let i64s = llvm_int(&mut ctx, 64);
+        let pad7 = pad(&mut ctx, 7);
+        assert_eq!(
+            struct_fields(&ctx, map.llvm_struct_ty),
+            vec![i64s, i8s, pad7]
+        );
+    }
+
+    #[test]
+    fn slot_map_zst_interleaving() {
+        let mut ctx = make_ctx();
+        // struct { a: u32 @ 0, z: PhantomData @ 4, b: u32 @ 4 }, size 8.
+        // The ZST is stripped (no slot, no pad split): { i32, i32 }.
+        let a = mir_uint(&mut ctx, 32);
+        let z = mir_zst(&mut ctx);
+        let b = mir_uint(&mut ctx, 32);
+        let layout = StructLayoutInfo {
+            field_types: vec![a, z, b],
+            mem_to_decl: vec![0, 1, 2],
+            field_offsets: vec![0, 4, 4],
+            total_size: 8,
+        };
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert_eq!(map.decl_to_llvm, vec![Some(0), None, Some(1)]);
+        let i32s = llvm_int(&mut ctx, 32);
+        assert_eq!(struct_fields(&ctx, map.llvm_struct_ty), vec![i32s, i32s]);
+    }
+
+    #[test]
+    fn slot_map_issue128_arena_shape() {
+        let mut ctx = make_ctx();
+        // The exact shape from issue #128 (examples/struct_field_layout):
+        //
+        //   enum Layout { Aos, Soa, AoSoA(u32) }          // -> { i8, i32 }
+        //   struct Arena { layout: Layout, cap: u32, stride: u32, big: u64 }
+        //
+        // rustc layout: layout @ 0 (8 bytes), big @ 8, cap @ 16,
+        // stride @ 20, size 24. The enum's lowered form { i8, i32 } only
+        // covers 5 of its 8 bytes, so a [3 x i8] pad takes slot 1:
+        //
+        //   { { i8, i32 }, [3 x i8], i64, i32, i32 }
+        //     layout=0     pad=1     big=2 cap=3 stride=4
+        let discr = mir_uint(&mut ctx, 8);
+        let payload = mir_uint(&mut ctx, 32);
+        let layout_enum: Ptr<TypeObj> = MirEnumType::get(
+            &mut ctx,
+            "Layout".into(),
+            discr,
+            vec![0, 1, 2],
+            vec![
+                EnumVariant::unit("Aos".into()),
+                EnumVariant::unit("Soa".into()),
+                EnumVariant::new("AoSoA".into(), vec![payload]),
+            ],
+        )
+        .into();
+        let cap = mir_uint(&mut ctx, 32);
+        let stride = mir_uint(&mut ctx, 32);
+        let big = mir_uint(&mut ctx, 64);
+
+        let layout = StructLayoutInfo {
+            field_types: vec![layout_enum, cap, stride, big],
+            mem_to_decl: vec![0, 3, 1, 2],
+            field_offsets: vec![0, 16, 20, 8],
+            total_size: 24,
+        };
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        assert_eq!(
+            map.decl_to_llvm,
+            vec![Some(0), Some(3), Some(4), Some(2)],
+            "cap/stride/big must skip the [3 x i8] pad at slot 1"
+        );
+
+        let i8s = llvm_int(&mut ctx, 8);
+        let i32s = llvm_int(&mut ctx, 32);
+        let i64s = llvm_int(&mut ctx, 64);
+        let enum_llvm: Ptr<TypeObj> =
+            llvm_types::StructType::get_unnamed(&mut ctx, vec![i8s, i32s]).into();
+        let pad3 = pad(&mut ctx, 3);
+        assert_eq!(
+            struct_fields(&ctx, map.llvm_struct_ty),
+            vec![enum_llvm, pad3, i64s, i32s, i32s]
+        );
+    }
+
+    #[test]
+    fn slot_map_nested_struct_uses_stored_size() {
+        let mut ctx = make_ctx();
+        // Inner struct whose stored rustc size (16) exceeds the sum of its
+        // converted LLVM field sizes (i8 + i64 = 9, no offsets stored).
+        // The outer walk must advance by the stored 16, reaching the next
+        // field's offset exactly: NO interior pad before it.
+        let x = mir_uint(&mut ctx, 8);
+        let y = mir_uint(&mut ctx, 64);
+        let inner: Ptr<TypeObj> = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Inner".into(),
+            vec!["x".into(), "y".into()],
+            vec![x, y],
+            vec![],
+            vec![],
+            16,
+            0,
+        )
+        .into();
+        let c = mir_uint(&mut ctx, 8);
+
+        let layout = StructLayoutInfo {
+            field_types: vec![inner, c],
+            mem_to_decl: vec![0, 1],
+            field_offsets: vec![0, 16],
+            total_size: 24,
+        };
+        let map = build_struct_slot_map(&mut ctx, &layout).unwrap();
+
+        // inner = slot 0, c = slot 1 (adjacent), trailing [7 x i8] pad.
+        assert_eq!(map.decl_to_llvm, vec![Some(0), Some(1)]);
+        let fields = struct_fields(&ctx, map.llvm_struct_ty);
+        assert_eq!(fields.len(), 3, "exactly one (trailing) pad slot");
+        let pad7 = pad(&mut ctx, 7);
+        assert_eq!(fields[2], pad7);
+    }
+
+    #[test]
+    fn slot_map_rejects_malformed_memory_order() {
+        let mut ctx = make_ctx();
+        let a = mir_uint(&mut ctx, 8);
+        let b = mir_uint(&mut ctx, 64);
+
+        // Not a permutation: decl index 0 appears twice.
+        let dup = StructLayoutInfo {
+            field_types: vec![a, b],
+            mem_to_decl: vec![0, 0],
+            field_offsets: vec![],
+            total_size: 0,
+        };
+        assert!(build_struct_slot_map(&mut ctx, &dup).is_err());
+
+        // Wrong length.
+        let short = StructLayoutInfo {
+            field_types: vec![a, b],
+            mem_to_decl: vec![0],
+            field_offsets: vec![],
+            total_size: 0,
+        };
+        assert!(build_struct_slot_map(&mut ctx, &short).is_err());
+
+        // Offsets vector length mismatch (with explicit layout engaged).
+        let bad_offsets = StructLayoutInfo {
+            field_types: vec![a, b],
+            mem_to_decl: vec![0, 1],
+            field_offsets: vec![0],
+            total_size: 16,
+        };
+        assert!(build_struct_slot_map(&mut ctx, &bad_offsets).is_err());
+    }
 }

@@ -3301,10 +3301,10 @@ impl Parse for CudaLaunchAsyncInput {
     }
 }
 
-/// Launch a CUDA kernel asynchronously, returning a lazy [`AsyncKernelLaunch`].
+/// Launch a CUDA kernel asynchronously, returning a lazy `AsyncKernelLaunch`.
 ///
 /// Unlike [`cuda_launch!`], this macro does **not** take a `stream:` parameter. The
-/// CUDA stream is assigned later by the active [`SchedulingPolicy`] when the returned
+/// CUDA stream is assigned later by the active `SchedulingPolicy` when the returned
 /// operation is `.sync()`'d or `.await`'d. This enables lazy composition: multiple
 /// launches can be chained with `.and_then()`, run in parallel with `zip!()`, or
 /// awaited individually.
@@ -3327,7 +3327,7 @@ impl Parse for CudaLaunchAsyncInput {
 ///
 /// # Returns
 ///
-/// An [`AsyncKernelLaunch`] implementing [`DeviceOperation`]. No GPU work is enqueued
+/// An `AsyncKernelLaunch` implementing `DeviceOperation`. No GPU work is enqueued
 /// until the caller schedules it.
 ///
 /// # Usage

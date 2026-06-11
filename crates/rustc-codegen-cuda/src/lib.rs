@@ -73,7 +73,7 @@
 //! │   │   │                 │           │                         │           │     │
 //! │   │   │ dialect-mir     │           │  Standard x86_64 code   │           │     │
 //! │   │   │     ▼ (mem2reg) │           │                         │           │     │
-//! │   │   │ dialect-llvm    │           │                         │           │     │
+//! │   │   │ LLVM dialect    │           │                         │           │     │
 //! │   │   │     ▼           │           │                         │           │     │
 //! │   │   │ LLVM IR (.ll)   │           │                         │           │     │
 //! │   │   │     ▼ (llc)     │           │                         │           │     │
@@ -280,7 +280,7 @@
 //! |------------------------|--------------------------------------|
 //! | `CUDA_OXIDE_VERBOSE`   | Print detailed compilation progress  |
 //! | `CUDA_OXIDE_DUMP_MIR`  | Dump the `dialect-mir` module        |
-//! | `CUDA_OXIDE_DUMP_LLVM` | Dump the `dialect-llvm` module       |
+//! | `CUDA_OXIDE_DUMP_LLVM` | Dump the LLVM dialect module         |
 //! | `CUDA_OXIDE_PTX_DIR`   | Override PTX output directory        |
 //! | `CUDA_OXIDE_TARGET`    | Override GPU target (e.g., `sm_90a`) |
 //!
@@ -372,7 +372,7 @@ pub struct CudaCodegenConfig {
     pub dump_rustc_mir: bool,
     /// Dump the `dialect-mir` module during device compilation.
     pub dump_mir_dialect: bool,
-    /// Dump the `dialect-llvm` module during device compilation.
+    /// Dump the LLVM dialect module during device compilation.
     pub dump_llvm_dialect: bool,
     /// Override PTX output directory (defaults to current directory).
     pub ptx_output_dir: Option<std::path::PathBuf>,

@@ -38,7 +38,7 @@
 //!   sync launch methods from an inline kernel module. Enable the `async`
 //!   feature for borrowed and owned async launch methods.
 //! - [`cuda_launch!`]: Low-level launch macro retained for migration.
-//! - [`cuda_launch_async!`]: Low-level async launch macro retained for
+//! - `cuda_launch_async!`: Low-level async launch macro retained for
 //!   migration when the `async` feature is enabled.
 //!
 //! ## Usage

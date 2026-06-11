@@ -291,7 +291,7 @@ impl Verify for MirDisjointSliceType {
 /// * Field types must be valid.
 #[pliron_type(
     name = "mir.struct",
-    format = "`<` $name `,` `[` vec($field_names, CharSpace(`,`)) `]` `,` `[` vec($field_types, CharSpace(`,`)) `]` `,` `[` vec($mem_to_decl, CharSpace(`,`)) `]` `,` `[` vec($field_offsets, CharSpace(`,`)) `]` `,` $total_size `>`"
+    format = "`<` $name `,` `[` vec($field_names, CharSpace(`,`)) `]` `,` `[` vec($field_types, CharSpace(`,`)) `]` `,` `[` vec($mem_to_decl, CharSpace(`,`)) `]` `,` `[` vec($field_offsets, CharSpace(`,`)) `]` `,` $total_size `,` $abi_align `>`"
 )]
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct MirStructType {
@@ -301,7 +301,7 @@ pub struct MirStructType {
     pub field_names: Vec<String>,
     /// Field types in declaration order (parallel to field_names)
     pub field_types: Vec<Ptr<TypeObj>>,
-    /// Memory order mapping: mem_to_decl[mem_idx] = decl_idx.
+    /// Memory order mapping: `mem_to_decl[mem_idx] = decl_idx`.
     /// Empty means identity (no reordering).
     pub mem_to_decl: Vec<usize>,
     /// Byte offset of each field in declaration order (bytes).
@@ -310,6 +310,12 @@ pub struct MirStructType {
     /// Total struct size in bytes (including trailing padding).
     /// 0 means size is not known (fallback to LLVM layout).
     pub total_size: u64,
+    /// ABI alignment in bytes, from rustc layout. 0 means unknown.
+    ///
+    /// Captures `repr(align(N))` raises: over-alignment is an operation
+    /// property in LLVM, so this is carried here and stamped as `align N`
+    /// on loads/stores/allocas during lowering.
+    pub abi_align: u64,
 }
 
 impl MirStructType {
@@ -334,7 +340,16 @@ impl MirStructType {
         field_types: Vec<Ptr<TypeObj>>,
         mem_to_decl: Vec<usize>,
     ) -> TypePtr<Self> {
-        Self::get_with_full_layout(ctx, name, field_names, field_types, mem_to_decl, vec![], 0)
+        Self::get_with_full_layout(
+            ctx,
+            name,
+            field_names,
+            field_types,
+            mem_to_decl,
+            vec![],
+            0,
+            0,
+        )
     }
 
     /// Create a new struct type with complete layout information from rustc.
@@ -346,6 +361,8 @@ impl MirStructType {
     /// * `mem_to_decl` - Memory order mapping (empty = identity)
     /// * `field_offsets` - Byte offset of each field in declaration order (empty = unknown)
     /// * `total_size` - Total struct size in bytes (0 = unknown)
+    /// * `abi_align` - ABI alignment in bytes (0 = unknown)
+    #[allow(clippy::too_many_arguments)]
     pub fn get_with_full_layout(
         ctx: &mut Context,
         name: String,
@@ -354,6 +371,7 @@ impl MirStructType {
         mem_to_decl: Vec<usize>,
         field_offsets: Vec<u64>,
         total_size: u64,
+        abi_align: u64,
     ) -> TypePtr<Self> {
         Type::register_instance(
             MirStructType {
@@ -363,6 +381,7 @@ impl MirStructType {
                 mem_to_decl,
                 field_offsets,
                 total_size,
+                abi_align,
             },
             ctx,
         )
@@ -383,6 +402,7 @@ impl MirStructType {
                 mem_to_decl: vec![],
                 field_offsets: vec![],
                 total_size: 0,
+                abi_align: 0,
             },
             ctx,
         )
@@ -541,43 +561,94 @@ impl EnumVariant {
 
 /// An enum type (algebraic data type with multiple variants).
 ///
-/// Represents Rust enums like Option<T>, Result<T,E>, and custom enums.
+/// Represents Rust enums like `Option<T>`, `Result<T,E>`, and custom enums.
 ///
-/// Memory layout follows Rust's enum representation:
-/// - Discriminant (integer type based on variant count)
-/// - Payload (union of all variant payloads, sized to largest)
+/// Lowered as a `{tag, variant fields...}` struct:
+/// - Discriminant tag sourced from rustc's layout (width AND signedness of
+///   the tag scalar for Direct-tag enums; a variant-count fallback for the
+///   niched / single-variant models, which are deliberately un-niched).
+///   The tag holds the variant's DECLARED discriminant value, never its
+///   variant index.
+/// - All variants' payload fields concatenated in declaration order (NOT
+///   overlapped like Rust's real layout). mir-lower uses `total_size` to pad
+///   the struct to rustc's size, or to reject such enums loudly at the
+///   kernel ABI boundary when concatenation makes the struct larger than
+///   the Rust object (device-local use stays self-consistent and allowed).
 ///
 /// Note: For simplicity, we store variant info in flattened vectors
-/// since the #[format_type] macro has trouble with nested structs.
+/// since the `#[format_type]` macro has trouble with nested structs.
 ///
 /// # Verification
 /// * Must have at least one variant.
 /// * Discriminant type must be an integer type.
 #[pliron_type(
     name = "mir.enum",
-    format = "`<` $name `,` $discriminant_ty `,` `[` vec($variant_names, CharSpace(`,`)) `]` `,` `[` vec($variant_field_counts, CharSpace(`,`)) `]` `,` `[` vec($all_field_types, CharSpace(`,`)) `]` `>`"
+    format = "`<` $name `,` $discriminant_ty `,` `[` vec($variant_names, CharSpace(`,`)) `]` `,` `[` vec($variant_discriminants, CharSpace(`,`)) `]` `,` `[` vec($variant_field_counts, CharSpace(`,`)) `]` `,` `[` vec($all_field_types, CharSpace(`,`)) `]` `,` $total_size `,` $abi_align `>`"
 )]
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct MirEnumType {
     /// The enum name (e.g., "Option", "Result")
     pub name: String,
-    /// The discriminant type (usually u8, u16, or u32)
+    /// The discriminant type, sourced from rustc's layout: the tag scalar's
+    /// width and signedness for Direct-tag enums (so `#[repr(uN/iN)]`,
+    /// `#[repr(C)]`, sparse and negative discriminants are all honoured); a
+    /// variant-count fallback for the niched / single-variant models.
     pub discriminant_ty: Ptr<TypeObj>,
     /// Variant names in order
     pub variant_names: Vec<String>,
+    /// Declared discriminant VALUES in variant order, as the unsigned bit
+    /// pattern at tag width (e.g. `Ordering::Less` = -1 is stored as 255
+    /// for an i8 tag). These are values, not variant indices.
+    pub variant_discriminants: Vec<u64>,
     /// Number of fields for each variant (parallel to variant_names)
     pub variant_field_counts: Vec<u32>,
     /// All field types concatenated (use variant_field_counts to split)
     pub all_field_types: Vec<Ptr<TypeObj>>,
+    /// Total enum size in bytes from rustc layout (including padding).
+    /// 0 means unknown / not memory-faithful; mir-lower then keeps the
+    /// plain concatenated `{tag, fields...}` struct as-is.
+    ///
+    /// Populated only for `TagEncoding::Direct` enums: niched and
+    /// single-variant shapes use an un-niched model whose size has
+    /// nothing to do with rustc's layout, so they stay 0.
+    pub total_size: u64,
+    /// ABI alignment in bytes, from rustc layout. 0 means unknown.
+    pub abi_align: u64,
 }
 
 impl MirEnumType {
     /// Create a new enum type from EnumVariant definitions.
+    ///
+    /// Size and alignment are left 0 ("unknown"); use
+    /// [`Self::get_with_layout`] when rustc layout information is available.
     pub fn get(
         ctx: &mut Context,
         name: String,
         discriminant_ty: Ptr<TypeObj>,
+        variant_discriminants: Vec<u64>,
         variants: Vec<EnumVariant>,
+    ) -> TypePtr<Self> {
+        Self::get_with_layout(
+            ctx,
+            name,
+            discriminant_ty,
+            variant_discriminants,
+            variants,
+            0,
+            0,
+        )
+    }
+
+    /// Create a new enum type from EnumVariant definitions plus rustc layout
+    /// information (total size and ABI alignment in bytes; 0 = unknown).
+    pub fn get_with_layout(
+        ctx: &mut Context,
+        name: String,
+        discriminant_ty: Ptr<TypeObj>,
+        variant_discriminants: Vec<u64>,
+        variants: Vec<EnumVariant>,
+        total_size: u64,
+        abi_align: u64,
     ) -> TypePtr<Self> {
         // Flatten variants into parallel vectors
         let mut variant_names = Vec::with_capacity(variants.len());
@@ -595,8 +666,11 @@ impl MirEnumType {
                 name,
                 discriminant_ty,
                 variant_names,
+                variant_discriminants,
                 variant_field_counts,
                 all_field_types,
+                total_size,
+                abi_align,
             },
             ctx,
         )
@@ -610,6 +684,18 @@ impl MirEnumType {
     /// Get the discriminant type.
     pub fn discriminant_type(&self) -> Ptr<TypeObj> {
         self.discriminant_ty
+    }
+
+    /// Get total enum size in bytes from rustc layout.
+    /// Returns 0 if size is not known.
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    /// Get the ABI alignment in bytes from rustc layout.
+    /// Returns 0 if alignment is not known.
+    pub fn abi_align(&self) -> u64 {
+        self.abi_align
     }
 
     /// Get the number of variants.
@@ -648,7 +734,7 @@ impl MirEnumType {
             .and_then(|idx| self.get_variant(idx))
     }
 
-    /// Check if this is Option<T> type.
+    /// Check if this is `Option<T>` type.
     pub fn is_option(&self) -> bool {
         self.name == "Option" && self.variant_names.len() == 2
     }
@@ -666,6 +752,18 @@ impl Verify for MirEnumType {
             return verify_err!(
                 Location::Unknown,
                 "MirEnumType must have at least one variant"
+            );
+        }
+        if self.variant_names.len() != self.variant_discriminants.len() {
+            return verify_err!(
+                Location::Unknown,
+                "MirEnumType variant discriminant count must match variant count"
+            );
+        }
+        if self.variant_names.len() != self.variant_field_counts.len() {
+            return verify_err!(
+                Location::Unknown,
+                "MirEnumType variant field count must match variant count"
             );
         }
         Ok(())

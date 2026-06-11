@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Cast operation conversion: `dialect-mir` → `dialect-llvm`.
+//! Cast operation conversion: `dialect-mir` → LLVM dialect.
 //!
 //! Dispatches on `MirCastKindAttr` (preserved from Rust MIR) to select the
 //! correct LLVM instruction. This avoids guessing cast semantics from types.
@@ -54,12 +54,12 @@
 
 use crate::convert::types::convert_type;
 use crate::helpers;
-use dialect_llvm::op_interfaces::CastOpInterface;
-use dialect_llvm::ops as llvm;
-use dialect_llvm::types::FuncType;
 use dialect_mir::attributes::MirCastKindAttr;
 use dialect_mir::ops::MirCastOp;
 use dialect_mir::types::{MirArrayType, MirPtrType};
+use llvm_export::op_interfaces::CastOpInterface;
+use llvm_export::ops as llvm;
+use llvm_export::types::FuncType;
 use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::type_interfaces::FloatTypeInterface;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -348,7 +348,7 @@ fn emit_unsize_cast(
     };
 
     if let Some(len) = array_len {
-        let dst_is_struct = llvm_ty.deref(ctx).is::<dialect_llvm::types::StructType>();
+        let dst_is_struct = llvm_ty.deref(ctx).is::<llvm_export::types::StructType>();
 
         if dst_is_struct {
             let undef = llvm::UndefOp::new(ctx, llvm_ty);
@@ -392,15 +392,15 @@ fn emit_pointer_cast(
     val_ty: Ptr<pliron::r#type::TypeObj>,
     llvm_ty: Ptr<pliron::r#type::TypeObj>,
 ) -> Result<Ptr<Operation>> {
-    let src_is_struct = val_ty.deref(ctx).is::<dialect_llvm::types::StructType>();
-    let dst_is_struct = llvm_ty.deref(ctx).is::<dialect_llvm::types::StructType>();
+    let src_is_struct = val_ty.deref(ctx).is::<llvm_export::types::StructType>();
+    let dst_is_struct = llvm_ty.deref(ctx).is::<llvm_export::types::StructType>();
     let src_as = val_ty
         .deref(ctx)
-        .downcast_ref::<dialect_llvm::types::PointerType>()
+        .downcast_ref::<llvm_export::types::PointerType>()
         .map(|pt| pt.address_space());
     let dst_as = llvm_ty
         .deref(ctx)
-        .downcast_ref::<dialect_llvm::types::PointerType>()
+        .downcast_ref::<llvm_export::types::PointerType>()
         .map(|pt| pt.address_space());
     let dst_is_ptr = dst_as.is_some();
     let src_is_ptr = src_as.is_some();
@@ -420,7 +420,7 @@ fn emit_pointer_cast(
         && let Some(niche) = read_niche_info(ctx, op)
         && (src_is_int || src_is_ptr)
     {
-        return emit_scalar_to_niched_enum(ctx, rewriter, val, val_ty, llvm_ty, niche);
+        return emit_scalar_to_niched_enum(ctx, rewriter, op, val, val_ty, llvm_ty, niche);
     }
 
     if src_is_struct && dst_is_ptr {
@@ -458,7 +458,8 @@ fn emit_pointer_cast(
         Ok(llvm::LoadOp::new(ctx, ptr, llvm_ty).get_operation())
     } else if let (Some(s), Some(d)) = (src_as, dst_as) {
         if s != d {
-            Ok(llvm::AddrSpaceCastOp::new(ctx, val, d).get_operation())
+            let cast_ty = llvm_export::types::PointerType::get(ctx, d).into();
+            Ok(llvm::AddrSpaceCastOp::new(ctx, val, cast_ty).get_operation())
         } else {
             Ok(llvm::BitcastOp::new(ctx, val, llvm_ty).get_operation())
         }
@@ -548,7 +549,7 @@ fn deep_scalar_index_path(
         }
         let next = {
             let r = current.deref(ctx);
-            let s = r.downcast_ref::<dialect_llvm::types::StructType>()?;
+            let s = r.downcast_ref::<llvm_export::types::StructType>()?;
             if s.num_fields() != 1 {
                 return None;
             }
@@ -581,6 +582,7 @@ fn read_niche_info(
 fn emit_scalar_to_niched_enum(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
     val: pliron::value::Value,
     val_ty: Ptr<pliron::r#type::TypeObj>,
     llvm_ty: Ptr<pliron::r#type::TypeObj>,
@@ -589,7 +591,7 @@ fn emit_scalar_to_niched_enum(
     let (disc_ty, payload_ty) = {
         let r = llvm_ty.deref(ctx);
         let s = r
-            .downcast_ref::<dialect_llvm::types::StructType>()
+            .downcast_ref::<llvm_export::types::StructType>()
             .ok_or_else(|| {
                 pliron::input_error_noloc!("emit_scalar_to_niched_enum: dst is not a struct")
             })?;
@@ -602,11 +604,46 @@ fn emit_scalar_to_niched_enum(
         (s.field_type(0), s.field_type(1))
     };
 
+    // Field 0 carries ONE tag semantic everywhere: the variant's declared
+    // discriminant VALUE. The niche attribute records variant INDICES, so
+    // map them through the result enum's variant_discriminants before
+    // storing. For Option-likes (discriminants [0, 1]) this is the
+    // identity, but enums with explicit discriminants must not see a raw
+    // index in the tag slot (issue #132 groundwork).
+    let (niche_disc_value, untagged_disc_value) = {
+        let mir_result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+        let mir_result_ty_obj = mir_result_ty.deref(ctx);
+        let enum_ty = mir_result_ty_obj
+            .downcast_ref::<dialect_mir::types::MirEnumType>()
+            .ok_or_else(|| {
+                pliron::input_error_noloc!(
+                    "emit_scalar_to_niched_enum: niche-encoded cast result is not a MirEnumType"
+                )
+            })?;
+        let discr_of = |idx: u32| -> Result<u64> {
+            enum_ty
+                .variant_discriminants
+                .get(idx as usize)
+                .copied()
+                .ok_or_else(|| {
+                    pliron::input_error_noloc!(
+                        "emit_scalar_to_niched_enum: variant index {} has no discriminant ({} discriminants recorded)",
+                        idx,
+                        enum_ty.variant_discriminants.len()
+                    )
+                })
+        };
+        (
+            discr_of(niche.niche_variant_idx)?,
+            discr_of(niche.untagged_variant_idx)?,
+        )
+    };
+
     // Build a comparison constant in the source's own type. For integer
     // sources that's just the niche bit pattern; for pointer sources we
     // construct it as `inttoptr i64 <niche_start>` (which folds to `null`
     // when niche_start is 0, the case rustc actually emits).
-    let src_is_ptr = val_ty.deref(ctx).is::<dialect_llvm::types::PointerType>();
+    let src_is_ptr = val_ty.deref(ctx).is::<llvm_export::types::PointerType>();
     let cmp_const = if src_is_ptr {
         let i64_ty: Ptr<pliron::r#type::TypeObj> =
             IntegerType::get(ctx, 64, Signedness::Signless).into();
@@ -620,15 +657,15 @@ fn emit_scalar_to_niched_enum(
 
     let icmp = llvm::ICmpOp::new(
         ctx,
-        dialect_llvm::attributes::ICmpPredicateAttr::EQ,
+        llvm_export::attributes::ICmpPredicateAttr::EQ,
         val,
         cmp_const,
     );
     rewriter.insert_operation(ctx, icmp.get_operation());
     let is_niche = icmp.get_operation().deref(ctx).get_result(0);
 
-    let niche_disc = const_int_of(ctx, rewriter, disc_ty, niche.niche_variant_idx as i64)?;
-    let untagged_disc = const_int_of(ctx, rewriter, disc_ty, niche.untagged_variant_idx as i64)?;
+    let niche_disc = const_int_of(ctx, rewriter, disc_ty, niche_disc_value as i64)?;
+    let untagged_disc = const_int_of(ctx, rewriter, disc_ty, untagged_disc_value as i64)?;
     let disc_select = llvm::SelectOp::new(ctx, is_niche, niche_disc, untagged_disc);
     rewriter.insert_operation(ctx, disc_select.get_operation());
     let disc = disc_select.get_operation().deref(ctx).get_result(0);
@@ -712,14 +749,14 @@ fn single_scalar_struct_width(ctx: &Context, ty: Ptr<pliron::r#type::TypeObj>) -
         if let Some(i) = r.downcast_ref::<IntegerType>() {
             return Some(i.width());
         }
-        if let Some(p) = r.downcast_ref::<dialect_llvm::types::PointerType>() {
+        if let Some(p) = r.downcast_ref::<llvm_export::types::PointerType>() {
             // Pointers are addressed as opaque integer-width bit patterns
             // for the purpose of memory-round-trip sizing. CUDA targets
             // 64-bit pointers across address spaces.
             let _ = p;
             return Some(64);
         }
-        let s = r.downcast_ref::<dialect_llvm::types::StructType>()?;
+        let s = r.downcast_ref::<llvm_export::types::StructType>()?;
         if s.num_fields() != 1 {
             return None;
         }
@@ -740,7 +777,7 @@ fn convert_float_to_float(
     let dst_width = float_bit_width(ctx, llvm_ty)?;
 
     let flags_key: pliron::identifier::Identifier = "llvm_fast_math_flags".try_into().unwrap();
-    let flags = dialect_llvm::attributes::FastmathFlagsAttr::default();
+    let flags = llvm_export::attributes::FastmathFlagsAttr::default();
 
     if src_width < dst_width {
         let op = llvm::FPExtOp::new(ctx, val, llvm_ty);

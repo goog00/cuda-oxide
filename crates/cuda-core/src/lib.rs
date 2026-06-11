@@ -327,7 +327,7 @@ pub unsafe fn launch_kernel_ex_on_stream(
 ///
 /// A *cooperative* launch guarantees that every block in the grid is
 /// co-resident on the device, which is the precondition for grid-wide
-/// barriers like [`cuda_device::grid::sync()`]. The CUDA driver also
+/// barriers like `cuda_device::grid::sync()`. The CUDA driver also
 /// populates PTX environment registers `%envreg1` / `%envreg2` with the
 /// pointer to the per-launch grid workspace; the device-side barrier
 /// implementation reads those registers to find the shared counter.

@@ -36,7 +36,7 @@ jobs:
         #   * `rustc-codegen-cuda` — its own [workspace] that links against
         #     `rustc-private` dylibs; covered by the dedicated clippy job.
         include:
-          - package: dialect-llvm
+          - package: llvm-export
           - package: dialect-mir
           - package: dialect-nvvm
           - package: mir-importer

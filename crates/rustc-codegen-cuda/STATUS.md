@@ -1,0 +1,20 @@
+# rustc-codegen-cuda: error example status
+
+Examples named `error*` fall into two kinds:
+
+- **diagnostics-fixture**: intentional negative test. The compiler is supposed
+  to reject this. It is not a gap.
+- **support-gap**: a real Rust feature that the compiler does not yet handle.
+  Kept as an expected-failure regression test until it is implemented.
+
+When adding a new `error*` example, update this table and the
+`ERROR_EXAMPLES` array in `scripts/smoketest.sh` in the same commit.
+Run `scripts/check-error-example-status.sh` to verify both are in sync.
+
+| Example                               | Kind                | Fails at                            |
+| :------------------------------------ | :------------------ | :---------------------------------- |
+| `error`                               | diagnostics-fixture | `core::fmt` reachable from device   |
+| `error_copy_nonoverlapping_unhandled` | support-gap         | `StatementKind::CopyNonOverlapping` |
+| `error_drop_glue`                     | support-gap         | `TerminatorKind::Drop`              |
+| `error_set_discriminant_unhandled`    | support-gap         | `StatementKind::SetDiscriminant`    |
+| `error_wgmma_mma_unimplemented`       | support-gap         | WGMMA MMA lowering                  |

@@ -593,7 +593,7 @@ impl Verify for MirConstructTupleOp {
 ///
 /// Rust array literals like `[1.0, 2.0, 3.0, 4.0]` compile to
 /// `AggregateKind::Array` in rustc's MIR. This op represents that construct
-/// in `dialect-mir`, before lowering to `dialect-llvm`.
+/// in `dialect-mir`, before lowering to the LLVM dialect.
 ///
 /// # Example
 ///
