@@ -32,7 +32,7 @@
 //!   cargo oxide run enum_abi_multi_payload
 
 use cuda_core::{CudaContext, DeviceBuffer, DeviceCopy, LaunchConfig};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{kernel, thread, DisjointSlice};
 use cuda_host::cuda_module;
 
 /// Two overlapping payload variants (different types at byte 4) plus a
@@ -98,7 +98,11 @@ fn main() {
     println!("=== enum_abi_multi_payload: field-faithful enum ABI ===\n");
 
     // The premise of the whole example: rustc overlaps the payloads.
-    assert_eq!(std::mem::size_of::<E>(), 8, "rustc layout: tag + overlapped payloads");
+    assert_eq!(
+        std::mem::size_of::<E>(),
+        8,
+        "rustc layout: tag + overlapped payloads"
+    );
 
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
     let ptx_path = concat!(env!("CARGO_MANIFEST_DIR"), "/enum_abi_multi_payload.ptx");
