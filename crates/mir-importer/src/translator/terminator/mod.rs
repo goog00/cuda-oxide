@@ -2072,6 +2072,7 @@ fn try_dispatch_intrinsic(
             loc,
         )?)),
 
+        // =================================================================
         // Debug & Profiling (from intrinsics::debug)
         // =================================================================
         "cuda_device::debug::clock" => Ok(Some(intrinsics::debug::emit_clock(
