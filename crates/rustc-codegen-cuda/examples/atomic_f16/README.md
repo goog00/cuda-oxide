@@ -19,8 +19,7 @@ The default binary checks:
 ## Benchmark
 
 ```bash
-./crates/rustc-codegen-cuda/examples/atomic_f16/run-bench.sh --arch sm_103 \
-  > crates/rustc-codegen-cuda/examples/atomic_f16/traces/atomic_f16_bench.csv
+./crates/rustc-codegen-cuda/examples/atomic_f16/run-bench.sh --arch sm_103
 ```
 
 The benchmark emits CSV:
@@ -35,11 +34,11 @@ generated PTX (`bench.ptx`) to see whether the backend selected `atom` or
 `red` for a given toolchain.
 
 Scalar f16 atomics are a correctness feature, not a guaranteed speedup over f32
-atomics. The checked-in trace plot shows the exact-integer accumulation limit
-for repeated f16 `+1`; use the benchmark on target hardware for throughput.
+atomics. Repeated f16 `+1` accumulation also saturates at the exact-integer
+limit (2048); use the benchmark on target hardware for throughput.
 
-The checked-in benchmark trace was collected with `--arch sm_103`. Scalar f16
-global atomics were slower than f32 in every measured case:
+A reference run collected with `--arch sm_103` showed scalar f16 global
+atomics slower than f32 in every measured case:
 
 ```text
 bins  f32 unused Mops  f16 unused Mops  slowdown
@@ -51,8 +50,3 @@ bins  f32 unused Mops  f16 unused Mops  slowdown
 
 The benchmark does not cover packed `f16x2` atomics. Those require a separate
 packed-half API and are not a drop-in replacement for scalar `DeviceAtomicF16`.
-
-## Traces
-
-The `traces/` directory contains the checked-in `sm_103` benchmark CSV and PNG
-artifacts used to document the scalar f16 vs f32 behavior.
