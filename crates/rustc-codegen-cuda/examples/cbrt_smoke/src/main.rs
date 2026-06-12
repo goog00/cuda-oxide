@@ -32,27 +32,32 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, kernel, thread};
-use cuda_host::{cuda_launch, ltoir};
+use cuda_host::{cuda_module, ltoir};
 
-#[kernel]
-pub fn cbrt_f32(xs: &[f32], mut out: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let i = idx.get();
-    if i < xs.len()
-        && let Some(slot) = out.get_mut(idx)
-    {
-        *slot = xs[i].cbrt();
+#[cuda_module]
+mod kernels {
+    use super::*;
+
+    #[kernel]
+    pub fn cbrt_f32(xs: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < xs.len()
+            && let Some(slot) = out.get_mut(idx)
+        {
+            *slot = xs[i].cbrt();
+        }
     }
-}
 
-#[kernel]
-pub fn cbrt_f64(xs: &[f64], mut out: DisjointSlice<f64>) {
-    let idx = thread::index_1d();
-    let i = idx.get();
-    if i < xs.len()
-        && let Some(slot) = out.get_mut(idx)
-    {
-        *slot = xs[i].cbrt();
+    #[kernel]
+    pub fn cbrt_f64(xs: &[f64], mut out: DisjointSlice<f64>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < xs.len()
+            && let Some(slot) = out.get_mut(idx)
+        {
+            *slot = xs[i].cbrt();
+        }
     }
 }
 
@@ -96,14 +101,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `__nv_*` calls in the kernel force the NVVM-IR output flavor; the
     // first launch builds a cubin via libNVVM + nvJitLink.
     let module = ltoir::load_kernel_module(&ctx, "cbrt_smoke")?;
+    let module = kernels::from_module(module)?;
 
     // Negative / zero / small / large magnitudes, plus perfect cubes whose
     // root is exactly representable (8 -> 2, 27 -> 3, -64 -> -4, 1000 -> 10).
     // Values are f32-representable so the same array doubles as f64 input
     // after a widening cast.
     let xs_f32: Vec<f32> = vec![
-        0.0, -0.0, 1.0, -1.0, 8.0, -8.0, 27.0, -64.0, 1000.0, 0.125, -0.125, 2.0, -2.0, 1e-3,
-        -1e6, 1e6,
+        0.0, -0.0, 1.0, -1.0, 8.0, -8.0, 27.0, -64.0, 1000.0, 0.125, -0.125, 2.0, -2.0, 1e-3, -1e6,
+        1e6,
     ];
     let xs_f64: Vec<f64> = xs_f32.iter().map(|&v| v as f64).collect();
     let n = xs_f32.len();
@@ -115,16 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out_cbrt_f32 = DeviceBuffer::<f32>::zeroed(&stream, n)?;
     let mut out_cbrt_f64 = DeviceBuffer::<f64>::zeroed(&stream, n)?;
 
-    cuda_launch! {
-        kernel: cbrt_f32,
-        stream: stream, module: module, config: cfg,
-        args: [slice(xs32), slice_mut(out_cbrt_f32)]
-    }?;
-    cuda_launch! {
-        kernel: cbrt_f64,
-        stream: stream, module: module, config: cfg,
-        args: [slice(xs64), slice_mut(out_cbrt_f64)]
-    }?;
+    module.cbrt_f32(&stream, cfg, &xs32, &mut out_cbrt_f32)?;
+    module.cbrt_f64(&stream, cfg, &xs64, &mut out_cbrt_f64)?;
 
     let got_cbrt_f32 = out_cbrt_f32.to_host_vec(&stream)?;
     let got_cbrt_f64 = out_cbrt_f64.to_host_vec(&stream)?;
