@@ -348,8 +348,14 @@ mod tests {
         for (path, expected) in [
             ("std::sys::cmath::cbrtf", RustFloatMathIntrinsic::CbrtF32),
             ("std::sys::cmath::cbrt", RustFloatMathIntrinsic::CbrtF64),
-            ("core::num::imp::libm::cbrtf", RustFloatMathIntrinsic::CbrtF32),
-            ("core::num::imp::libm::cbrt", RustFloatMathIntrinsic::CbrtF64),
+            (
+                "core::num::imp::libm::cbrtf",
+                RustFloatMathIntrinsic::CbrtF32,
+            ),
+            (
+                "core::num::imp::libm::cbrt",
+                RustFloatMathIntrinsic::CbrtF64,
+            ),
         ] {
             assert_eq!(
                 RustFloatMathIntrinsic::from_core_path(path),
