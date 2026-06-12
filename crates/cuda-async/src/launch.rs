@@ -387,7 +387,7 @@ impl<'a> IntoFuture for AsyncKernelLaunch<'a> {
     }
 }
 
-impl<R: Send> DeviceOperation for OwnedAsyncKernelLaunch<R> {
+impl<R: Send + 'static> DeviceOperation for OwnedAsyncKernelLaunch<R> {
     type Output = R;
 
     unsafe fn execute(self, ctx: &ExecutionContext) -> Result<R, DeviceError> {
@@ -397,7 +397,7 @@ impl<R: Send> DeviceOperation for OwnedAsyncKernelLaunch<R> {
     }
 }
 
-impl<R: Send> IntoFuture for OwnedAsyncKernelLaunch<R> {
+impl<R: Send + 'static> IntoFuture for OwnedAsyncKernelLaunch<R> {
     type Output = Result<R, DeviceError>;
     type IntoFuture = DeviceFuture<R, OwnedAsyncKernelLaunch<R>>;
 

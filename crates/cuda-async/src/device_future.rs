@@ -25,6 +25,7 @@
 
 use crate::device_operation::{DeviceOperation, ExecutionContext};
 use crate::error::DeviceError;
+use crate::reclaim;
 use futures::task::AtomicWaker;
 use std::future::Future;
 use std::io::{self, Write};
@@ -83,14 +84,20 @@ impl StreamCallbackState {
 /// Constructed by [`SchedulingPolicy::schedule`] or by the [`IntoFuture`] impl
 /// on any `DeviceOperation`.
 ///
-/// Dropping an in-flight future synchronizes its assigned stream before
-/// releasing the stored result so owned launch resources stay alive until the
-/// submitted GPU work has completed.
+/// # Cancellation
+///
+/// Dropping the future never cancels submitted GPU work; kernels always run
+/// to completion. Dropping an in-flight future records a CUDA event on the
+/// assigned stream and parks the stored result in the [`reclaim`] limbo,
+/// deferring host-side reclamation until the device timeline passes that
+/// event. The drop itself never blocks on GPU progress.
+///
+/// [`reclaim`]: crate::reclaim
 ///
 /// [`SchedulingPolicy::schedule`]: crate::scheduling_policies::SchedulingPolicy::schedule
 /// [`IntoFuture`]: std::future::IntoFuture
 #[derive(Debug)]
-pub struct DeviceFuture<T: Send, DO: DeviceOperation<Output = T>> {
+pub struct DeviceFuture<T: Send + 'static, DO: DeviceOperation<Output = T>> {
     /// The operation to execute. Consumed on first poll.
     pub(crate) device_operation: Option<DO>,
     /// Stream and context for execution. Set by the scheduling policy.
@@ -105,7 +112,7 @@ pub struct DeviceFuture<T: Send, DO: DeviceOperation<Output = T>> {
     pub(crate) callback_state: Option<Arc<StreamCallbackState>>,
 }
 
-impl<T: Send, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
+impl<T: Send + 'static, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
     /// Creates an idle future with no operation or context attached.
     pub fn new() -> Self {
         Self::default()
@@ -157,6 +164,51 @@ impl<T: Send, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
         Ok(())
     }
 
+    /// Hands a submitted-but-undelivered result to deferred reclamation.
+    ///
+    /// Records a completion event on the assigned stream and parks the
+    /// result in the [`reclaim`] limbo; the result is dropped by a later
+    /// sweep once the device timeline passes the event. Never blocks in
+    /// this path. Only when the event cannot be recorded does it fall back
+    /// to [`cleanup_executing_result_with`], which synchronizes the stream
+    /// and, if even that fails, leaks the result loudly.
+    ///
+    /// [`cleanup_executing_result_with`]: Self::cleanup_executing_result_with
+    fn reclaim_in_flight_result(&mut self) {
+        if self.state != DeviceFutureState::Executing || self.result.is_none() {
+            return;
+        }
+        let stream = self
+            .execution_context
+            .as_ref()
+            .map(|ctx| Arc::clone(ctx.get_cuda_stream()));
+        if let Some(stream) = &stream
+            && let Ok(event) = stream.record_event(None)
+        {
+            let result = self.result.take().expect("Checked above.");
+            reclaim::park(event, Box::new(result));
+            return;
+        }
+        // No execution context, or the driver rejected the event record.
+        // Fall back to the blocking path before resorting to a loud leak.
+        self.cleanup_executing_result_with(move || {
+            let stream = stream.ok_or_else(|| {
+                DeviceError::Internal(
+                    "Cannot clean up an in-flight future without an execution context.".to_string(),
+                )
+            })?;
+            stream.synchronize().map_err(DeviceError::Driver)
+        });
+    }
+
+    /// Blocking cleanup fallback: runs `synchronize` and drops the stored
+    /// result on success; on failure the result is leaked loudly, because
+    /// dropping resources the device may still use is worse than leaking.
+    ///
+    /// Deferred (non-blocking) reclamation in
+    /// [`reclaim_in_flight_result`](Self::reclaim_in_flight_result) is
+    /// always preferred; this path only runs when no completion event could
+    /// be recorded.
     fn cleanup_executing_result_with<F>(&mut self, synchronize: F)
     where
         F: FnOnce() -> Result<(), DeviceError>,
@@ -187,7 +239,7 @@ impl<T: Send, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
     }
 }
 
-impl<T: Send, DO: DeviceOperation<Output = T>> Default for DeviceFuture<T, DO> {
+impl<T: Send + 'static, DO: DeviceOperation<Output = T>> Default for DeviceFuture<T, DO> {
     fn default() -> Self {
         Self {
             device_operation: Default::default(),
@@ -202,25 +254,14 @@ impl<T: Send, DO: DeviceOperation<Output = T>> Default for DeviceFuture<T, DO> {
 
 /// `DeviceFuture` does not contain self-referential pointers, so it is safe
 /// to move.
-impl<T: Send, DO: DeviceOperation<Output = T>> Unpin for DeviceFuture<T, DO> {}
+impl<T: Send + 'static, DO: DeviceOperation<Output = T>> Unpin for DeviceFuture<T, DO> {}
 
-impl<T: Send, DO: DeviceOperation<Output = T>> Drop for DeviceFuture<T, DO> {
+impl<T: Send + 'static, DO: DeviceOperation<Output = T>> Drop for DeviceFuture<T, DO> {
     fn drop(&mut self) {
-        // Clone the stream handle out of `execution_context` first: the
-        // cleanup helper takes `&mut self`, so the closure must not borrow
-        // `self` (E0502).
-        let stream = self
-            .execution_context
-            .as_ref()
-            .map(|ctx| Arc::clone(ctx.get_cuda_stream()));
-        self.cleanup_executing_result_with(move || {
-            let stream = stream.ok_or_else(|| {
-                DeviceError::Internal(
-                    "Cannot clean up an in-flight future without an execution context.".to_string(),
-                )
-            })?;
-            stream.synchronize().map_err(DeviceError::Driver)
-        });
+        // Reclaim earlier cancellations whose GPU work has since finished,
+        // then defer this future's own in-flight result (if any).
+        reclaim::sweep();
+        self.reclaim_in_flight_result();
     }
 }
 
@@ -232,9 +273,13 @@ impl<T: Send, DO: DeviceOperation<Output = T>> Drop for DeviceFuture<T, DO> {
 /// | `Idle`      | Executes the operation, registers callback, -> Pending. |
 /// | `Executing` | Checks callback flag; returns result if done.           |
 /// | `Complete`  | Panics -- must not poll after completion.               |
-impl<T: Send, DO: DeviceOperation<Output = T>> Future for DeviceFuture<T, DO> {
+impl<T: Send + 'static, DO: DeviceOperation<Output = T>> Future for DeviceFuture<T, DO> {
     type Output = Result<T, DeviceError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Opportunistically reclaim cancelled results whose GPU work has
+        // completed. Cheap when nothing is parked (one atomic load).
+        reclaim::sweep();
+
         if self.state == DeviceFutureState::Failed {
             self.state = DeviceFutureState::Complete;
             let error = self
