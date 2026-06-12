@@ -1149,11 +1149,7 @@ mod tests {
             let func_op = module_block.deref(&ctx).iter(&ctx).next().unwrap();
             let kernel_attr = StringAttr::new("true".to_string());
             let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
-            func_op
-                .deref_mut(&ctx)
-                .attributes
-                .0
-                .insert(key, kernel_attr.into());
+            func_op.deref_mut(&ctx).attributes.set(key, kernel_attr);
         }
 
         // The slot map lowers MultiPayload byte-identically to rustc's
@@ -1206,11 +1202,7 @@ mod tests {
             let func_op = module_block.deref(&ctx).iter(&ctx).next().unwrap();
             let kernel_attr = StringAttr::new("true".to_string());
             let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
-            func_op
-                .deref_mut(&ctx)
-                .attributes
-                .0
-                .insert(key, kernel_attr.into());
+            func_op.deref_mut(&ctx).attributes.set(key, kernel_attr);
         }
 
         let err = crate::lower_mir_to_llvm(&mut ctx, module_ptr)
