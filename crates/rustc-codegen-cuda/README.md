@@ -119,7 +119,7 @@ The `examples/` directory contains standalone kernel crates that exercise differ
 | `dynamic_smem`               | Dynamic shared memory allocation                           |
 | `barrier`                    | `__syncthreads` and barrier semantics                      |
 | `atomics`                    | Atomic operations on device                                |
-| `atomic_f16`                 | Scalar f16 atomic add/sub checks and microbenchmarks        |
+| `atomic_f16`                 | Scalar f16 atomic correctness checks and microbenchmarks   |
 | `printf`                     | Device-side `printf` via FFI                               |
 | `tma_copy`                   | Tensor Memory Accelerator copies (Hopper+)                 |
 | `tma_multicast`              | TMA with multicast across CTAs                             |

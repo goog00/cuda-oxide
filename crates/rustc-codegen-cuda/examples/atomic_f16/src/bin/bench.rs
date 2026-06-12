@@ -4,7 +4,7 @@
 //! f32 vs f16 global atomic-add microbenchmark.
 //!
 //! Run:
-//!   ./crates/rustc-codegen-cuda/examples/atomic_f16/run-bench.sh --arch sm_103
+//!   ./crates/rustc-codegen-cuda/examples/atomic_f16/run-bench.sh
 
 #![feature(f16)]
 

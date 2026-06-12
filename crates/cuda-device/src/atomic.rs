@@ -35,7 +35,7 @@
 //! | Type                         | Operations                                 |
 //! |------------------------------|--------------------------------------------|
 //! | Integer (U32, I32, U64, I64) | load, store, all RMW ops, compare_exchange |
-//! | Float (F32, F64)             | load, store, fetch_add, swap               |
+//! | Float (F16, F32, F64)        | load, store, fetch_add, fetch_sub, swap    |
 //!
 //! Float atomics do **not** support compare_exchange (PTX has no `atom.cas`
 //! for float types) or bitwise operations.
@@ -127,7 +127,7 @@ pub enum AtomicOrdering {
 /// - `new(val)` — constructor
 /// - `from_ptr(ptr)` — non-owning view over existing `*mut T` memory
 /// - `load`, `store` — atomic load/store
-/// - `fetch_add`, `fetch_sub`: arithmetic RMW
+/// - `fetch_add`, `fetch_sub` — arithmetic RMW
 /// - `fetch_and`, `fetch_or`, `fetch_xor` — bitwise RMW
 /// - `fetch_min`, `fetch_max` — comparison RMW
 /// - `swap` — atomic exchange
@@ -216,7 +216,7 @@ macro_rules! define_integer_atomic {
                 unreachable!(concat!(stringify!($Name), "::fetch_add called outside CUDA kernel context"))
             }
 
-            /// Atomically subtract `val` and return the previous value.
+            /// Atomically subtract `val` and return the **previous** value.
             #[inline(never)]
             pub fn fetch_sub(&self, val: $ty, order: AtomicOrdering) -> $ty {
                 let _ = (val, order);
@@ -324,7 +324,7 @@ macro_rules! define_integer_atomic {
 /// - `new(val)` — constructor
 /// - `from_ptr(ptr)` — non-owning view over existing `*mut T` memory
 /// - `load`, `store` — atomic load/store
-/// - `fetch_add`, `fetch_sub`: arithmetic RMW
+/// - `fetch_add`, `fetch_sub` — arithmetic RMW
 /// - `swap` — atomic exchange (`atomicrmw xchg`)
 ///
 /// **Not supported** (PTX hardware limitation):
@@ -404,9 +404,10 @@ macro_rules! define_float_atomic {
                 unreachable!(concat!(stringify!($Name), "::fetch_add called outside CUDA kernel context"))
             }
 
-            /// Atomically subtract `val` and return the previous value.
+            /// Atomically subtract `val` and return the **previous** value.
             ///
-            /// Uses LLVM `atomicrmw fsub`.
+            /// Lowered as `atomicrmw fadd` of the negated value, so the
+            /// backend can keep using native PTX add atomics.
             #[inline(never)]
             pub fn fetch_sub(&self, val: $ty, order: AtomicOrdering) -> $ty {
                 let _ = (val, order);
@@ -453,9 +454,10 @@ define_integer_atomic! {
 }
 
 define_float_atomic! {
-    /// 16 bit float atomic, device scope (`.gpu`).
+    /// 16-bit float atomic, **device scope** (`.gpu`).
     ///
     /// `fetch_add`/`fetch_sub` lower to hardware `atom.add.noftz.f16` (sm_70+).
+    /// On pre-sm_70 targets llc expands them to a compare-and-swap loop instead.
     pub struct DeviceAtomicF16(f16);
 }
 
@@ -504,7 +506,7 @@ define_integer_atomic! {
 }
 
 define_float_atomic! {
-    /// 16 bit float atomic, block scope (`.cta`).
+    /// 16-bit float atomic, **block scope** (`.cta`).
     ///
     /// `fetch_add`/`fetch_sub` lower to `atom.add.noftz.f16` with `.cta` scope.
     pub struct BlockAtomicF16(f16);

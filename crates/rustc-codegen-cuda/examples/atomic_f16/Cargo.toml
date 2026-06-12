@@ -9,7 +9,7 @@ default-run = "atomic_f16"
 [workspace]
 
 # Demonstrates DeviceAtomicF16 (`atom.add.noftz.f16`).
-# Build/run with:  cargo oxide run atomic_f16 --arch sm_103
+# Build/run with:  cargo oxide run atomic_f16
 [[bin]]
 name = "atomic_f16"
 path = "src/main.rs"

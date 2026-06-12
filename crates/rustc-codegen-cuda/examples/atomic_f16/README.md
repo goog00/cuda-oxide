@@ -5,7 +5,7 @@ Correctness and microbenchmark coverage for scalar `f16` CUDA atomics.
 ## Correctness
 
 ```bash
-cargo oxide run atomic_f16 --arch sm_103
+cargo oxide run atomic_f16
 ```
 
 The default binary checks:
@@ -19,8 +19,10 @@ The default binary checks:
 ## Benchmark
 
 ```bash
-./crates/rustc-codegen-cuda/examples/atomic_f16/run-bench.sh --arch sm_103
+./crates/rustc-codegen-cuda/examples/atomic_f16/run-bench.sh
 ```
+
+The GPU architecture is auto-detected; pass `--arch sm_XX` to override.
 
 The benchmark emits CSV:
 

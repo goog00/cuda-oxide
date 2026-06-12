@@ -3,7 +3,7 @@
 
 //! Half-precision atomic histogram checks.
 //!
-//! Run: cargo oxide run atomic_f16 --arch sm_103
+//! Run: cargo oxide run atomic_f16
 
 #![feature(f16)]
 
