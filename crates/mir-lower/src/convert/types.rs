@@ -1086,12 +1086,21 @@ pub(crate) fn make_slice_struct(ctx: &mut Context) -> Ptr<TypeObj> {
 
 #[cfg(test)]
 mod tests {
-    //! Hardware-free unit tests for [`build_struct_slot_map`]: the slot map
-    //! and the LLVM struct type are produced by the same walk, so these
-    //! tests pin down both for the layout shapes from issue #128.
+    //! Hardware-free unit tests for the type-conversion functions in this
+    //! module. Two groups live here:
+    //!
+    //! - [`build_struct_slot_map`]: the slot map and the LLVM struct type are
+    //!   produced by the same walk, so these tests pin down both for the
+    //!   layout shapes from issue #128.
+    //! - `convert_type`, `convert_function_type`, `is_zero_sized_type`,
+    //!   `is_kernel_func`, `make_slice_struct`: pure type-level functions, so
+    //!   they're testable directly without standing up a module or running the
+    //!   conversion driver.
 
     use super::*;
-    use dialect_mir::types::{EnumVariant, MirEnumType};
+    use dialect_mir::types::{EnumVariant, MirArrayType, MirEnumType, MirFP16Type, MirPtrType};
+    use pliron::builtin::attributes::StringAttr;
+    use pliron::op::Op;
 
     fn make_ctx() -> Context {
         let mut ctx = Context::new();
@@ -1126,6 +1135,24 @@ mod tests {
             .expect("expected an LLVM struct type")
             .fields()
             .collect()
+    }
+
+    /// Down-cast a type pointer to an `IntegerType` and pass it to `f`.
+    fn with_integer<R>(ctx: &Context, ty: Ptr<TypeObj>, f: impl FnOnce(&IntegerType) -> R) -> R {
+        let ty_ref = ty.deref(ctx);
+        let int_ty = ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("expected integer");
+        f(int_ty)
+    }
+
+    /// `(arg types, single result type)` of a converted LLVM function type.
+    fn func_inputs_and_result(
+        ctx: &Context,
+        func_ty: pliron::r#type::TypePtr<llvm_types::FuncType>,
+    ) -> (Vec<Ptr<TypeObj>>, Ptr<TypeObj>) {
+        let r = func_ty.deref(ctx);
+        (r.arg_types(), r.result_type())
     }
 
     #[test]
@@ -1348,5 +1375,376 @@ mod tests {
             total_size: 16,
         };
         assert!(build_struct_slot_map(&mut ctx, &bad_offsets).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // is_kernel_func
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_kernel_func_keys_off_gpu_kernel_attribute() {
+        let mut ctx = make_ctx();
+        // Any op with attribute storage works; pick mir.unreachable since
+        // it has no operands/results to set up.
+        let op = Operation::new(
+            &mut ctx,
+            dialect_mir::ops::MirUnreachableOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        );
+        assert!(!is_kernel_func(&ctx, op), "no attr → not a kernel");
+
+        let key: pliron::identifier::Identifier = "gpu_kernel".try_into().unwrap();
+        op.deref_mut(&ctx)
+            .attributes
+            .set(key, StringAttr::new("true".to_string()));
+        assert!(is_kernel_func(&ctx, op), "with attr → kernel");
+    }
+
+    // -----------------------------------------------------------------
+    // is_zero_sized_type
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_zero_sized_type_detects_empty_and_nested_zst_structs() {
+        let mut ctx = make_ctx();
+        let empty = llvm_types::StructType::get_unnamed(&mut ctx, vec![]);
+        assert!(is_zero_sized_type(&ctx, empty.into()));
+
+        // Nested: a struct whose only fields are themselves empty structs is
+        // still ZST. The implementation's recursive `.all(...)` branch.
+        let nested =
+            llvm_types::StructType::get_unnamed(&mut ctx, vec![empty.into(), empty.into()]);
+        assert!(is_zero_sized_type(&ctx, nested.into()));
+
+        // Non-empty struct: not ZST.
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let one_field = llvm_types::StructType::get_unnamed(&mut ctx, vec![i32_ty]);
+        assert!(!is_zero_sized_type(&ctx, one_field.into()));
+
+        // Scalars are never ZST under this predicate.
+        assert!(!is_zero_sized_type(&ctx, i32_ty));
+    }
+
+    // -----------------------------------------------------------------
+    // convert_type
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn convert_type_normalizes_integer_signedness_to_signless() {
+        let mut ctx = make_ctx();
+        for sign in [
+            Signedness::Signed,
+            Signedness::Unsigned,
+            Signedness::Signless,
+        ] {
+            let input: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, sign).into();
+            let out = convert_type(&mut ctx, input).expect("integer conversion failed");
+            with_integer(&ctx, out, |int_ty| {
+                assert_eq!(
+                    int_ty.signedness(),
+                    Signedness::Signless,
+                    "signedness must collapse to Signless (sign={:?})",
+                    sign
+                );
+                assert_eq!(int_ty.width(), 32, "width must be preserved");
+            });
+        }
+    }
+
+    #[test]
+    fn convert_type_handles_float_widths() {
+        let mut ctx = make_ctx();
+
+        let f16 = MirFP16Type::get(&ctx);
+        let f16_out = convert_type(&mut ctx, f16.into()).unwrap();
+        assert!(
+            f16_out.deref(&ctx).is::<llvm_types::HalfType>(),
+            "MirFP16Type must lower to llvm.half"
+        );
+
+        // f32/f64 are builtin pliron floats and pass through unchanged.
+        let f32 = FP32Type::get(&ctx);
+        assert_eq!(
+            convert_type(&mut ctx, f32.into()).unwrap(),
+            f32.into(),
+            "FP32 must pass through"
+        );
+        let f64 = FP64Type::get(&ctx);
+        assert_eq!(
+            convert_type(&mut ctx, f64.into()).unwrap(),
+            f64.into(),
+            "FP64 must pass through"
+        );
+    }
+
+    #[test]
+    fn convert_type_preserves_pointer_address_space() {
+        let mut ctx = make_ctx();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+
+        for (mir_ptr, expected_as) in [
+            (
+                MirPtrType::get_generic(&mut ctx, i32_ty, true),
+                llvm_types::address_space::GENERIC,
+            ),
+            (
+                MirPtrType::get_global(&mut ctx, i32_ty, true),
+                llvm_types::address_space::GLOBAL,
+            ),
+            (
+                MirPtrType::get_shared(&mut ctx, i32_ty, true),
+                llvm_types::address_space::SHARED,
+            ),
+            (
+                MirPtrType::get_constant(&mut ctx, i32_ty, false),
+                llvm_types::address_space::CONSTANT,
+            ),
+        ] {
+            let out = convert_type(&mut ctx, mir_ptr.into()).unwrap();
+            let ty_ref = out.deref(&ctx);
+            let llvm_ptr = ty_ref
+                .downcast_ref::<llvm_types::PointerType>()
+                .expect("expected llvm.ptr");
+            assert_eq!(
+                llvm_ptr.address_space(),
+                expected_as,
+                "address space must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn convert_type_maps_slice_and_disjoint_slice_to_fat_pointer_struct() {
+        let mut ctx = make_ctx();
+        let f32_ty: Ptr<TypeObj> = FP32Type::get(&ctx).into();
+
+        for ty in [
+            MirSliceType::get(&mut ctx, f32_ty).into(),
+            MirDisjointSliceType::get(&mut ctx, f32_ty).into(),
+        ] {
+            let out = convert_type(&mut ctx, ty).unwrap();
+            let fields = struct_fields(&ctx, out);
+            assert_eq!(fields.len(), 2, "fat pointer = (ptr, i64)");
+            assert!(fields[0].deref(&ctx).is::<llvm_types::PointerType>());
+            with_integer(&ctx, fields[1], |i| {
+                assert_eq!(i.width(), 64, "len must be i64");
+            });
+        }
+    }
+
+    #[test]
+    fn convert_type_strips_zst_fields_from_tuples() {
+        // The Rust unit type and PhantomData lower to ZST llvm.struct {}.
+        // A MirTupleType<(), i32, ()> must drop both unit fields and keep
+        // only the i32 — this is how NVPTX-incompatible empty params get
+        // filtered out before the function signature is built.
+        let mut ctx = make_ctx();
+        let unit_ty: Ptr<TypeObj> = MirTupleType::get(&mut ctx, vec![]).into();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let mixed: Ptr<TypeObj> =
+            MirTupleType::get(&mut ctx, vec![unit_ty, i32_ty, unit_ty]).into();
+
+        let out = convert_type(&mut ctx, mixed).unwrap();
+        let fields = struct_fields(&ctx, out);
+        assert_eq!(fields.len(), 1, "ZST tuple fields must be filtered out");
+        with_integer(&ctx, fields[0], |i| assert_eq!(i.width(), 32));
+    }
+
+    #[test]
+    fn convert_type_maps_array_recursively() {
+        let mut ctx = make_ctx();
+        // `[i32 (signed); 4]` → `[i32 (signless); 4]`.
+        let elem_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signed).into();
+        let arr = MirArrayType::get(&mut ctx, elem_ty, 4);
+        let out = convert_type(&mut ctx, arr.into()).unwrap();
+
+        let out_ref = out.deref(&ctx);
+        let arr_ty = out_ref
+            .downcast_ref::<llvm_types::ArrayType>()
+            .expect("expected llvm.array");
+        assert_eq!(arr_ty.size(), 4, "array size preserved");
+        with_integer(&ctx, arr_ty.elem_type(), |i| {
+            assert_eq!(i.width(), 32);
+            assert_eq!(
+                i.signedness(),
+                Signedness::Signless,
+                "element type must be recursively converted (signedness collapsed)"
+            );
+        });
+    }
+
+    #[test]
+    fn convert_type_maps_enum_to_discriminant_plus_all_variant_fields() {
+        // `enum E { A, B(i32) }` becomes `struct { i8, i32 }` — discriminant
+        // first, then all variant field types concatenated. With no rustc
+        // layout recorded (size 0) the converter takes the no-padding path.
+        let mut ctx = make_ctx();
+        let i8_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 8, Signedness::Signless).into();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let enum_ty = MirEnumType::get(
+            &mut ctx,
+            "E".to_string(),
+            i8_ty,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("A".to_string()),
+                EnumVariant::new("B".to_string(), vec![i32_ty]),
+            ],
+        );
+
+        let out = convert_type(&mut ctx, enum_ty.into()).unwrap();
+        let fields = struct_fields(&ctx, out);
+        assert_eq!(fields.len(), 2, "discriminant + 1 variant field");
+        with_integer(&ctx, fields[0], |i| assert_eq!(i.width(), 8, "discr is i8"));
+        with_integer(&ctx, fields[1], |i| {
+            assert_eq!(i.width(), 32, "payload is i32")
+        });
+    }
+
+    #[test]
+    fn convert_type_rejects_unsupported_type() {
+        // VoidType has no `MirTypeConversion` impl registered, so it should
+        // surface as the "Unsupported type conversion" error rather than
+        // silently round-tripping.
+        let mut ctx = make_ctx();
+        let void_ty: Ptr<TypeObj> = llvm_types::VoidType::get(&ctx).into();
+        let err = convert_type(&mut ctx, void_ty).expect_err("VoidType must be rejected");
+        assert!(
+            err.to_string().contains("Unsupported"),
+            "error message must explain why: {}",
+            err
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // make_slice_struct
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn make_slice_struct_is_generic_ptr_and_i64() {
+        let mut ctx = make_ctx();
+        let ty = make_slice_struct(&mut ctx);
+        let fields = struct_fields(&ctx, ty);
+        assert_eq!(fields.len(), 2);
+        let ty_ref = fields[0].deref(&ctx);
+        let ptr = ty_ref
+            .downcast_ref::<llvm_types::PointerType>()
+            .expect("slice ptr field");
+        assert_eq!(
+            ptr.address_space(),
+            llvm_types::address_space::GENERIC,
+            "slice ptr lives in generic addrspace because the kernel can't know which memory space at compile time"
+        );
+        with_integer(&ctx, fields[1], |i| assert_eq!(i.width(), 64));
+    }
+
+    // -----------------------------------------------------------------
+    // convert_function_type
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn convert_function_type_void_when_results_empty() {
+        let mut ctx = make_ctx();
+        let func_ty = FunctionType::get(&mut ctx, vec![], vec![]);
+        let out = convert_function_type(&mut ctx, func_ty, false).unwrap();
+        let (inputs, result) = func_inputs_and_result(&ctx, out);
+        assert!(inputs.is_empty());
+        assert!(
+            result.deref(&ctx).is::<llvm_types::VoidType>(),
+            "empty results must become llvm.void"
+        );
+    }
+
+    #[test]
+    fn convert_function_type_void_when_result_is_zst() {
+        // `fn() -> ()` is the common Rust case — empty tuple result must
+        // collapse to void.
+        let mut ctx = make_ctx();
+        let unit_ty: Ptr<TypeObj> = MirTupleType::get(&mut ctx, vec![]).into();
+        let func_ty = FunctionType::get(&mut ctx, vec![], vec![unit_ty]);
+        let out = convert_function_type(&mut ctx, func_ty, false).unwrap();
+        let (_, result) = func_inputs_and_result(&ctx, out);
+        assert!(
+            result.deref(&ctx).is::<llvm_types::VoidType>(),
+            "() result must lower to void, not an empty struct"
+        );
+    }
+
+    #[test]
+    fn convert_function_type_flattens_slice_args_to_ptr_and_len() {
+        // `fn(&[f32], i32) -> ()` → `fn(ptr, i64, i32) -> void`. Slice
+        // flattening happens on BOTH ABIs because the host launch helpers
+        // push (ptr, len) as two driver args.
+        let mut ctx = make_ctx();
+        let f32_ty: Ptr<TypeObj> = FP32Type::get(&ctx).into();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let slice_ty: Ptr<TypeObj> = MirSliceType::get(&mut ctx, f32_ty).into();
+        let func_ty = FunctionType::get(&mut ctx, vec![slice_ty, i32_ty], vec![]);
+
+        for kernel_entry in [false, true] {
+            let out = convert_function_type(&mut ctx, func_ty, kernel_entry).unwrap();
+            let (inputs, _) = func_inputs_and_result(&ctx, out);
+            assert_eq!(
+                inputs.len(),
+                3,
+                "slice must flatten to (ptr, i64), trailing scalar stays (kernel_entry={kernel_entry})"
+            );
+            assert!(inputs[0].deref(&ctx).is::<llvm_types::PointerType>());
+            with_integer(&ctx, inputs[1], |i| assert_eq!(i.width(), 64));
+            with_integer(&ctx, inputs[2], |i| assert_eq!(i.width(), 32));
+        }
+    }
+
+    #[test]
+    fn convert_function_type_struct_internal_abi_flattens_while_kernel_abi_keeps_intact() {
+        // The kernel-vs-internal struct split is the load-bearing distinction
+        // for the host-device ABI. The host pushes the closure as a single
+        // byval scalar, so at kernel boundaries the struct must stay intact.
+        // At internal call sites both sides are us, so we flatten.
+        let mut ctx = make_ctx();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let f32_ty: Ptr<TypeObj> = FP32Type::get(&ctx).into();
+        let struct_ty = MirStructType::get(
+            &mut ctx,
+            "Point".to_string(),
+            vec!["x".to_string(), "y".to_string()],
+            vec![i32_ty, f32_ty],
+        );
+        let func_ty = FunctionType::get(&mut ctx, vec![struct_ty.into()], vec![]);
+
+        let internal = convert_function_type(&mut ctx, func_ty, false).unwrap();
+        let (internal_inputs, _) = func_inputs_and_result(&ctx, internal);
+        assert_eq!(
+            internal_inputs.len(),
+            2,
+            "internal ABI must flatten Point → (i32, f32)"
+        );
+
+        let kernel = convert_function_type(&mut ctx, func_ty, true).unwrap();
+        let (kernel_inputs, _) = func_inputs_and_result(&ctx, kernel);
+        assert_eq!(
+            kernel_inputs.len(),
+            1,
+            "kernel ABI must keep Point as a single byval struct"
+        );
+        let fields = struct_fields(&ctx, kernel_inputs[0]);
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn convert_function_type_drops_zst_args() {
+        // NVPTX rejects empty param types. ZST args (unit, PhantomData,
+        // nested all-ZST structs) must vanish from the LLVM signature.
+        let mut ctx = make_ctx();
+        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let unit_ty: Ptr<TypeObj> = MirTupleType::get(&mut ctx, vec![]).into();
+        let func_ty = FunctionType::get(&mut ctx, vec![unit_ty, i32_ty, unit_ty], vec![]);
+        let out = convert_function_type(&mut ctx, func_ty, false).unwrap();
+        let (inputs, _) = func_inputs_and_result(&ctx, out);
+        assert_eq!(inputs.len(), 1, "two unit args must be dropped");
+        with_integer(&ctx, inputs[0], |i| assert_eq!(i.width(), 32));
     }
 }
