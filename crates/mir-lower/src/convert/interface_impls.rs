@@ -56,7 +56,8 @@ use dialect_nvvm::ops::{
     ReadPtxSregEnvReg1Op, ReadPtxSregEnvReg2Op, ReadPtxSregGlobaltimerOp, ReadPtxSregLaneIdOp,
     ReadPtxSregNclusterIdOp, ReadPtxSregNctaidXOp, ReadPtxSregNctaidYOp, ReadPtxSregNctaidZOp,
     ReadPtxSregNtidXOp, ReadPtxSregNtidYOp, ReadPtxSregNtidZOp, ReadPtxSregTidXOp,
-    ReadPtxSregTidYOp, ReadPtxSregTidZOp, ShflSyncBflyF32Op, ShflSyncBflyI32Op, ShflSyncDownF32Op,
+    ReadPtxSregTidYOp, ReadPtxSregTidZOp, ReduxSyncAddOp, ShflSyncBflyF32Op, ShflSyncBflyI32Op,
+    ShflSyncDownF32Op,
     ShflSyncDownI32Op, ShflSyncIdxF32Op, ShflSyncIdxI32Op, ShflSyncUpF32Op, ShflSyncUpI32Op,
     StmatrixM8n8X2Op, StmatrixM8n8X2TransOp, StmatrixM8n8X4Op, StmatrixM8n8X4TransOp,
     Tcgen05AllocCg2Op, Tcgen05AllocOp, Tcgen05CommitCg2Op, Tcgen05CommitMulticastCg2Op,
@@ -1862,6 +1863,24 @@ impl MirToLlvmConversion for MatchAllSyncI64Op {
             operands_info,
             "llvm_nvvm_match_all_sync_i64p",
             i64_ty.into(),
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ReduxSyncAddOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::warp::convert_redux(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "llvm_nvvm_redux_sync_add",
         )
     }
 }
