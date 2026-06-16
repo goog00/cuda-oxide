@@ -903,15 +903,13 @@ fn translate_call(
         }
     }
 
-    // Handle closure trait method calls (FnOnce::call_once, FnMut::call_mut, Fn::call)
-    // These calls pass arguments as a tuple, but the closure body expects unpacked args.
-    // We need to unpack the tuple before calling the closure.
-    //
-    // MIR shows: <{closure} as FnMut<(u32,)>>::call_mut(self_ref, tuple_args)
-    // But the closure body expects: fn(self_ref, unpacked_arg1, unpacked_arg2, ...)
+    // Handle genuine closure trait method calls. The receiver test matters:
+    // wrapper ADTs can carry a closure in their generic substitutions while
+    // still expecting the rust-call tuple as one argument.
     if let Some(ref name) = pattern_name
         && (name.contains("call_once") || name.contains("call_mut") || name.ends_with("::call"))
-        && substs_contains("Closure")
+        && !args.is_empty()
+        && receiver_is_closure(&args[0], body)
     {
         return translate_closure_call(
             ctx,
@@ -1449,6 +1447,46 @@ fn translate_closure_call(
     } else {
         Ok(call_op)
     }
+}
+
+/// True only when the rust-call receiver is itself a closure.
+///
+/// We type the operand's base local (or constant) and ignore any
+/// `place.projection`, and we peel at most one reference. Both are safe for
+/// the rust-call receiver specifically: rustc lowers a closure-trait call
+/// (`Fn::call` / `FnMut::call_mut` / `FnOnce::call_once`) so that the receiver
+/// argument is the closure passed by value, or a single `&`/`&mut` borrow of
+/// it, materialized into its own temporary local, never an in-place projection
+/// of a larger aggregate and never behind multiple references. So a closure
+/// reached through a field (`(self.f)(x)`) still arrives here as a base local
+/// of type `&{closure}`, and one `Ref` peel plus a base-local type check covers
+/// every genuine closure-call shape. A wrapper ADT that merely carries a
+/// closure in its generic substitutions (the case this guard exists to reject)
+/// has a non-closure receiver type and is correctly left on the ordinary call
+/// path with its rust-call tuple intact.
+fn receiver_is_closure(receiver: &mir::Operand, body: &mir::Body) -> bool {
+    let ty = match receiver {
+        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
+            let local: usize = place.local;
+            let local_decls: Vec<_> = body.local_decls().collect();
+            match local_decls.get(local).map(|(_, decl)| decl.ty) {
+                Some(ty) => ty,
+                None => return false,
+            }
+        }
+        mir::Operand::Constant(const_op) => const_op.const_.ty(),
+        _ => return false,
+    };
+
+    let inner = match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
+        _ => ty,
+    };
+
+    matches!(
+        inner.kind(),
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, _))
+    )
 }
 
 /// Extracts the closure body's mangled name from a closure operand.
