@@ -331,6 +331,9 @@ pub(crate) fn convert_checked_sub(
 /// The LLVM intrinsic returns `{iN, i1}` directly, matching the converted MIR
 /// result type. The `op` is replaced with the intrinsic call, so no
 /// InsertValue reassembly is needed.
+///
+/// The pliron symbol name uses underscores (`llvm_sadd_with_overflow_i32`);
+/// the llvm-export layer converts underscores back to dots on output.
 fn convert_checked_binop_with_intrinsic(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -348,7 +351,8 @@ fn convert_checked_binop_with_intrinsic(
         .map(|t| t.width())
         .ok_or_else(|| pliron::input_error!(loc, "checked binop: lhs must be an integer type"))?;
 
-    let intrinsic_name = format!("llvm.{op_name}.with.overflow.i{width}");
+    // Pliron identifiers use underscores; llvm-export converts to dots on output.
+    let intrinsic_name = format!("llvm_{op_name}_with_overflow_i{width}");
 
     let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
     let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![lhs_ty, i1_ty.into()]);
