@@ -42,9 +42,16 @@ by `pliron-llvm`), LLVM IR export, and PTX generation via `llc`.
 3. **mem2reg** — Promote scalar alloca slots back to SSA via
    `pliron::opts::mem2reg`, eliminating the load/store traffic the translator
    produced.
-4. **Lower** — Convert `dialect-mir` → LLVM dialect (via `mir-lower`).
-5. **Generate** — Export the LLVM dialect to textual LLVM IR, then invoke `llc`
-   for PTX (or emit NVVM IR).
+4. **Lower** — Convert `dialect-mir` → LLVM dialect (via `mir-lower`). Float
+   ops carry the `contract` fast-math flag so the NVPTX backend can fuse
+   `fmul+fadd` into `fma.rn.f32` (matching nvcc's `--fmad=true`).
+5. **Optimize** — Run `opt -O2` (via `LlvmToolchain`) on the exported IR.
+   Skipped for full-debug builds (`-G`) so locals stay inspectable under
+   cuda-gdb. Override with `CUDA_OXIDE_NO_OPT=1`.
+6. **Generate** — Invoke `llc -fp-contract=fast` for PTX (or emit NVVM IR).
+   The `-fp-contract=fast` flag activates the NVPTX backend's FMA contract
+   mode; pair with the IR `contract` flag from step 4. Disable with
+   `CUDA_OXIDE_NO_FMA=1` or `cargo oxide run --no-fmad`.
 
 ## Output Modes
 

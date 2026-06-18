@@ -36,16 +36,22 @@ cargo oxide setup                   # explicitly build the codegen backend
 
 ### Flags
 
-| Flag              | Applies to           | Description                              |
-|-------------------|----------------------|------------------------------------------|
-| `--emit-nvvm-ir`  | run, build, pipeline | Generate NVVM IR for libNVVM             |
-| `--arch <sm_XX>`  | run, build, pipeline | Target architecture override             |
-| `--features <F>`  | run, build           | Comma-separated cargo features to enable |
-| `-v, --verbose`   | run, build           | Show detailed compilation output         |
-| `--async`         | new                  | Use the async template                   |
-| `--cgdb`          | debug                | Use cgdb instead of cuda-gdb             |
-| `--tui`           | debug                | Use GDB's TUI interface                  |
-| `--check`         | fmt                  | Check formatting only                    |
+| Flag              | Applies to           | Description                                     |
+|-------------------|----------------------|-------------------------------------------------|
+| `--emit-nvvm-ir`  | run, build, pipeline | Generate NVVM IR for libNVVM                    |
+| `--arch <sm_XX>`  | run, build, pipeline | Target architecture override                    |
+| `--features <F>`  | run, build           | Comma-separated cargo features to enable        |
+| `-v, --verbose`   | run, build           | Show detailed compilation output                |
+| `--no-fmad`       | run, build, pipeline | Disable FMA contraction (keep separate mul+add) |
+| `--async`         | new                  | Use the async template                          |
+| `--cgdb`          | debug                | Use cgdb instead of cuda-gdb                    |
+| `--tui`           | debug                | Use GDB's TUI interface                         |
+| `--check`         | fmt                  | Check formatting only                           |
+
+`--no-fmad` disables FMA contraction for kernels that rely on two separate
+roundings (e.g. Dekker's algorithm, 2Sum). Equivalent to `CUDA_OXIDE_NO_FMA=1`.
+By default, FMA contraction is on (matching nvcc's `--fmad=true`): `fmul+fadd`
+pairs fuse into a single `fma.rn.f32` for fewer instructions and one rounding.
 
 ## Commands
 
