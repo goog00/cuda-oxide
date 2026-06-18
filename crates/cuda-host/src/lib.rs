@@ -104,7 +104,10 @@ pub use cuda_async;
 #[cfg(feature = "async")]
 pub use cuda_async::launch::{AsyncKernelLaunch, OwnedAsyncKernelLaunch};
 
-pub use embedded::{EmbeddedModuleError, load_embedded_module, load_first_embedded_module};
+pub use embedded::{
+    EmbeddedModuleError, load_all_ptx_bundles_merged, load_embedded_module,
+    load_first_embedded_module,
+};
 /// Loads a compiled kernel module by name. Tries `<name>.cubin`, then
 /// `<name>.ptx`, and finally falls through to the LTOIR build path
 /// (`<name>.ll` plus libdevice → cubin) when cuda-oxide auto-detected
