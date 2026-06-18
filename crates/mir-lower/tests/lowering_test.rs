@@ -670,10 +670,15 @@ fn test_cmp_predicate_lowering() -> Result<(), anyhow::Error> {
             for body_op in func_block.deref(&ctx).iter(&ctx) {
                 if let Some(fcmp) = Operation::get_op::<llvm::FCmpOp>(body_op, &ctx) {
                     fcmp_preds.push(fcmp.predicate(&ctx));
+                    // fcmp carries `contract` (set by add_fastmath_flags) which is a
+                    // no-op for comparisons at the LLVM / PTX level. Critically, nnan
+                    // is NOT set, so NaN checks like `x != x` still evaluate correctly.
+                    let expected: FastmathFlagsAttr =
+                        llvm_export::attributes::FastmathFlags::CONTRACT.into();
                     assert_eq!(
                         fcmp.fast_math_flags(&ctx),
-                        FastmathFlagsAttr::default(),
-                        "fcmp must carry empty fastmath flags: nnan would poison NaN checks"
+                        expected,
+                        "fcmp must carry only the contract flag (nnan would poison NaN checks)"
                     );
                 }
                 if let Some(icmp) = Operation::get_op::<llvm::ICmpOp>(body_op, &ctx) {

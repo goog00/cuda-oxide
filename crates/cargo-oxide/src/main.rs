@@ -71,6 +71,10 @@ enum Commands {
         /// Show verbose compilation output
         #[arg(short, long)]
         verbose: bool,
+        /// Disable FMA contraction (default: on, matching nvcc --fmad=true).
+        /// Also settable via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
     },
     /// Build an example or project (compile only, don't run)
     Build {
@@ -88,6 +92,10 @@ enum Commands {
         /// Show verbose compilation output
         #[arg(short, long)]
         verbose: bool,
+        /// Disable FMA contraction (default: on, matching nvcc --fmad=true).
+        /// Also settable via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
     },
     /// Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output
     Pipeline {
@@ -99,6 +107,10 @@ enum Commands {
         /// Target architecture (e.g., sm_90, sm_100, sm_120)
         #[arg(long)]
         arch: Option<String>,
+        /// Disable FMA contraction (default: on, matching nvcc --fmad=true).
+        /// Also settable via CUDA_OXIDE_NO_FMA=1.
+        #[arg(long)]
+        no_fmad: bool,
     },
     /// Build with debug info and launch cuda-gdb
     Debug {
@@ -160,6 +172,7 @@ fn main() {
             features,
             bin,
             verbose,
+            no_fmad,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "run");
@@ -172,6 +185,7 @@ fn main() {
                 arch.as_deref(),
                 features.as_deref(),
                 bin.as_deref(),
+                no_fmad,
             );
         }
         Commands::Build {
@@ -180,6 +194,7 @@ fn main() {
             arch,
             features,
             verbose,
+            no_fmad,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "build");
@@ -191,17 +206,19 @@ fn main() {
                 emit_nvvm_ir,
                 arch.as_deref(),
                 features.as_deref(),
+                no_fmad,
             );
         }
         Commands::Pipeline {
             example,
             emit_nvvm_ir,
             arch,
+            no_fmad,
         } => {
             let ctx = commands::resolve_context();
             let example = resolve_example_name(example, &ctx, "pipeline");
             validate_nvvm_ir_arch(&example, emit_nvvm_ir, &arch);
-            commands::codegen_show_pipeline(&ctx, &example, emit_nvvm_ir, arch.as_deref());
+            commands::codegen_show_pipeline(&ctx, &example, emit_nvvm_ir, arch.as_deref(), no_fmad);
         }
         Commands::Debug {
             example,

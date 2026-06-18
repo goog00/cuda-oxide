@@ -1148,6 +1148,13 @@ fn generate_ptx(
     if debug_kind.variables_enabled() {
         llc_cmd.arg("-O0");
     }
+    // Fuse fmul+fadd/fsub into fma.rn.f32, matching nvcc's default --fmad=true.
+    // The IR-side `contract` flag (set by add_fastmath_flags in mir-lower) grants
+    // permission; this llc flag activates the NVPTX backend's contract mode.
+    // Set CUDA_OXIDE_NO_FMA=1 or pass --no-fmad to cargo oxide to opt out.
+    if std::env::var("CUDA_OXIDE_NO_FMA").is_err() {
+        llc_cmd.arg("-fp-contract=fast");
+    }
     let result = llc_cmd.arg(llc_input).arg("-o").arg(ptx_path).output();
 
     match result {

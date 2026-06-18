@@ -141,6 +141,7 @@ pub fn codegen_run(
     arch: Option<&str>,
     features: Option<&str>,
     bin: Option<&str>,
+    no_fmad: bool,
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -231,6 +232,11 @@ pub fn codegen_run(
     forward_env_var(&mut cmd, "CUDA_OXIDE_SHOW_RUSTC_MIR");
     forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_MIR");
     forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
+    if no_fmad {
+        cmd.env("CUDA_OXIDE_NO_FMA", "1");
+    } else {
+        cmd.env_remove("CUDA_OXIDE_NO_FMA");
+    }
 
     apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
     apply_device_arch_hint(&mut cmd, arch, detected_device_arch.as_deref());
@@ -506,6 +512,7 @@ pub fn codegen_build(
     emit_nvvm_ir: bool,
     arch: Option<&str>,
     features: Option<&str>,
+    no_fmad: bool,
 ) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
@@ -557,6 +564,11 @@ pub fn codegen_build(
     forward_env_var(&mut cmd, "CUDA_OXIDE_SHOW_RUSTC_MIR");
     forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_MIR");
     forward_env_var(&mut cmd, "CUDA_OXIDE_DUMP_LLVM");
+    if no_fmad {
+        cmd.env("CUDA_OXIDE_NO_FMA", "1");
+    } else {
+        cmd.env_remove("CUDA_OXIDE_NO_FMA");
+    }
 
     apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
     apply_ld_library_path(&mut cmd);
@@ -585,7 +597,13 @@ pub fn codegen_build(
 /// `dialect-mir` module (pre- and post-`mem2reg`), the LLVM dialect
 /// module, textual LLVM IR, and the final PTX or NVVM IR. After the build,
 /// generated artifacts are printed to stdout.
-pub fn codegen_show_pipeline(ctx: &Context, example: &str, emit_nvvm_ir: bool, arch: Option<&str>) {
+pub fn codegen_show_pipeline(
+    ctx: &Context,
+    example: &str,
+    emit_nvvm_ir: bool,
+    arch: Option<&str>,
+    no_fmad: bool,
+) {
     let example_dir = if ctx.is_workspace {
         resolve_example_dir(ctx, example)
     } else {
@@ -630,6 +648,11 @@ pub fn codegen_show_pipeline(ctx: &Context, example: &str, emit_nvvm_ir: bool, a
     cmd.env("CUDA_OXIDE_SHOW_RUSTC_MIR", "1");
     cmd.env("CUDA_OXIDE_DUMP_MIR", "1");
     cmd.env("CUDA_OXIDE_DUMP_LLVM", "1");
+    if no_fmad {
+        cmd.env("CUDA_OXIDE_NO_FMA", "1");
+    } else {
+        cmd.env_remove("CUDA_OXIDE_NO_FMA");
+    }
 
     apply_output_mode(&mut cmd, emit_nvvm_ir, arch);
     apply_ld_library_path(&mut cmd);
