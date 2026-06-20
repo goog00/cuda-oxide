@@ -70,6 +70,83 @@ pub fn lane_id() -> u32 {
     unreachable!("lane_id called outside CUDA kernel context")
 }
 
+// =============================================================================
+// Lane-Position Masks
+// =============================================================================
+//
+// These five read-only special registers each return a 32-bit value whose
+// bit `k` corresponds to lane `k` in the warp. They encode the calling lane's
+// position relative to the rest of the warp and are the building blocks of
+// warp-level scans, prefix sums, and stream compaction.
+//
+// A typical idiom combines a ballot with `lanemask_lt`:
+//
+// ```rust,ignore
+// let active = warp::active_mask();
+// let pred   = some_condition();
+// let ballot = warp::ballot_sync(active, pred);
+// // How many lanes *before* me also voted true → my output slot.
+// let rank = (ballot & warp::lanemask_lt()).count_ones();
+// ```
+//
+// Unlike the `*_sync` collectives these are plain register reads: they require
+// no participation mask and are not warp-convergent.
+
+/// Mask of all lanes with ID **strictly less** than the calling lane.
+///
+/// PTX `%lanemask_lt` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.lt`). For lane
+/// `i` the result is `(1 << i) - 1`. The canonical input to a warp prefix sum:
+/// `(ballot & lanemask_lt()).count_ones()` is the number of earlier lanes that
+/// satisfied the ballot predicate.
+#[inline(never)]
+pub fn lanemask_lt() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.lt()
+    unreachable!("lanemask_lt called outside CUDA kernel context")
+}
+
+/// Mask of all lanes with ID **less than or equal to** the calling lane.
+///
+/// PTX `%lanemask_le` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.le`). For lane
+/// `i` the result is `(1 << (i + 1)) - 1` (i.e. `lanemask_lt() | lanemask_eq()`),
+/// giving an inclusive prefix mask.
+#[inline(never)]
+pub fn lanemask_le() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.le()
+    unreachable!("lanemask_le called outside CUDA kernel context")
+}
+
+/// Mask with **only the calling lane's** bit set.
+///
+/// PTX `%lanemask_eq` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.eq`). For lane
+/// `i` the result is `1 << i` — equivalent to `1u32 << lane_id()` but read
+/// directly from a hardware register.
+#[inline(never)]
+pub fn lanemask_eq() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.eq()
+    unreachable!("lanemask_eq called outside CUDA kernel context")
+}
+
+/// Mask of all lanes with ID **greater than or equal to** the calling lane.
+///
+/// PTX `%lanemask_ge` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.ge`). For lane
+/// `i` the result sets bits `i..=31` (i.e. `lanemask_gt() | lanemask_eq()`).
+#[inline(never)]
+pub fn lanemask_ge() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.ge()
+    unreachable!("lanemask_ge called outside CUDA kernel context")
+}
+
+/// Mask of all lanes with ID **strictly greater** than the calling lane.
+///
+/// PTX `%lanemask_gt` (LLVM `@llvm.nvvm.read.ptx.sreg.lanemask.gt`). For lane
+/// `i` the result sets bits `(i + 1)..=31`. Useful for "lanes after me" suffix
+/// scans and for finding the next active lane via `(ballot & lanemask_gt())`.
+#[inline(never)]
+pub fn lanemask_gt() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.lanemask.gt()
+    unreachable!("lanemask_gt called outside CUDA kernel context")
+}
+
 /// Synchronize a subset of warp lanes given by `mask`.
 ///
 /// PTX `bar.warp.sync mask` (LLVM `@llvm.nvvm.bar.warp.sync(i32)`). All

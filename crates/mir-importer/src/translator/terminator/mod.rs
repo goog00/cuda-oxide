@@ -67,8 +67,9 @@ use dialect_mir::ops::{
     MirAssertOp, MirCondBranchOp, MirConstantOp, MirEqOp, MirGotoOp, MirNotOp, MirReturnOp,
 };
 use dialect_nvvm::ops::{
-    ReadPtxSregCtaidXOp, ReadPtxSregCtaidYOp, ReadPtxSregNtidXOp, ReadPtxSregNtidYOp,
-    ReadPtxSregTidXOp, ReadPtxSregTidYOp,
+    ReadPtxSregCtaidXOp, ReadPtxSregCtaidYOp, ReadPtxSregLanemaskEqOp, ReadPtxSregLanemaskGeOp,
+    ReadPtxSregLanemaskGtOp, ReadPtxSregLanemaskLeOp, ReadPtxSregLanemaskLtOp, ReadPtxSregNtidXOp,
+    ReadPtxSregNtidYOp, ReadPtxSregTidXOp, ReadPtxSregTidYOp,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::OperandSegmentInterface;
@@ -2667,6 +2668,63 @@ fn try_dispatch_intrinsic(
         // =================================================================
         "cuda_device::warp::lane_id" => Ok(Some(intrinsics::warp::emit_lane_id(
             ctx,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        // Lane-position masks: zero-operand u32 special-register reads, same
+        // shape as the thread/block indexing sregs (see `emit_nvvm_intrinsic`).
+        "cuda_device::warp::lanemask_lt" => Ok(Some(helpers::emit_nvvm_intrinsic(
+            ctx,
+            ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::warp::lanemask_le" => Ok(Some(helpers::emit_nvvm_intrinsic(
+            ctx,
+            ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::warp::lanemask_eq" => Ok(Some(helpers::emit_nvvm_intrinsic(
+            ctx,
+            ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::warp::lanemask_ge" => Ok(Some(helpers::emit_nvvm_intrinsic(
+            ctx,
+            ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
+        "cuda_device::warp::lanemask_gt" => Ok(Some(helpers::emit_nvvm_intrinsic(
+            ctx,
+            ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
             destination,
             target,
             block_ptr,

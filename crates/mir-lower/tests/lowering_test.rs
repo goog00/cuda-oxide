@@ -265,6 +265,141 @@ fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Lower a single zero-operand, i32-result special-register op and assert it
+/// emits a declaration of and direct call to `intrinsic` (and no inline asm).
+fn assert_sreg_i32_lowers_to_intrinsic(
+    op_info: (
+        fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
+        std::any::TypeId,
+    ),
+    intrinsic: &str,
+) -> Result<(), anyhow::Error> {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
+    mir_lower::register(&mut ctx);
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_ptr = module.get_operation();
+
+    let func_name = "kernel_func";
+    let func_ty = pliron::builtin::types::FunctionType::get(&mut ctx, vec![], vec![]);
+
+    let func_op_ptr = Operation::new(
+        &mut ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let func_ty_attr = pliron::builtin::attributes::TypeAttr::new(func_ty.into());
+    let func = mir::MirFuncOp::new(&mut ctx, func_op_ptr, func_ty_attr);
+    func.set_symbol_name(&mut ctx, func_name.try_into().unwrap());
+
+    let region = func.get_operation().deref(&ctx).get_region(0);
+    let block = {
+        let b = pliron::basic_block::BasicBlock::new(&mut ctx, None, vec![]);
+        b.insert_at_back(region, &ctx);
+        b
+    };
+
+    let i32_ty = pliron::builtin::types::IntegerType::get(
+        &mut ctx,
+        32,
+        pliron::builtin::types::Signedness::Signless,
+    );
+    let sreg_op = Operation::new(&mut ctx, op_info, vec![i32_ty.into()], vec![], vec![], 0);
+    sreg_op.insert_at_back(block, &ctx);
+
+    let ret_op_ptr = Operation::new(
+        &mut ctx,
+        mir::MirReturnOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    let ret_op = mir::MirReturnOp::new(ret_op_ptr);
+    ret_op.get_operation().insert_at_back(block, &ctx);
+
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut found_decl = false;
+    let mut found_call = false;
+    let module_op = module_ptr.deref(&ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(&ctx).iter(&ctx).next().unwrap();
+
+    for op in block.deref(&ctx).iter(&ctx) {
+        let Some(func_op) = Operation::get_op::<llvm_export::ops::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        let name = func_op.get_symbol_name(&ctx).to_string();
+
+        if name == intrinsic {
+            found_decl = true;
+        } else if name == func_name {
+            let func_region = func_op.get_operation().deref(&ctx).get_region(0);
+            for func_block in func_region.deref(&ctx).iter(&ctx) {
+                for body_op in func_block.deref(&ctx).iter(&ctx) {
+                    if let Some(call) = Operation::get_op::<llvm::CallOp>(body_op, &ctx)
+                        && let CallOpCallable::Direct(sym) = call.callee(&ctx)
+                        && sym.to_string() == intrinsic
+                    {
+                        found_call = true;
+                    }
+                    assert!(
+                        Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx).is_none(),
+                        "{intrinsic} must not lower to inline asm"
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_decl,
+        "Expected `{intrinsic}` declaration in lowered module"
+    );
+    assert!(
+        found_call,
+        "Expected call to `{intrinsic}` in lowered kernel body"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_lanemask_ops_lower_to_sreg_intrinsic_calls() -> Result<(), anyhow::Error> {
+    // Each lane-position mask op lowers to its matching read-only sreg intrinsic
+    // (underscores become dots on export: `..._lanemask_lt` -> `...lanemask.lt`).
+    assert_sreg_i32_lowers_to_intrinsic(
+        nvvm::ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
+        "llvm_nvvm_read_ptx_sreg_lanemask_lt",
+    )?;
+    assert_sreg_i32_lowers_to_intrinsic(
+        nvvm::ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
+        "llvm_nvvm_read_ptx_sreg_lanemask_le",
+    )?;
+    assert_sreg_i32_lowers_to_intrinsic(
+        nvvm::ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
+        "llvm_nvvm_read_ptx_sreg_lanemask_eq",
+    )?;
+    assert_sreg_i32_lowers_to_intrinsic(
+        nvvm::ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
+        "llvm_nvvm_read_ptx_sreg_lanemask_ge",
+    )?;
+    assert_sreg_i32_lowers_to_intrinsic(
+        nvvm::ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
+        "llvm_nvvm_read_ptx_sreg_lanemask_gt",
+    )?;
+    Ok(())
+}
+
 #[test]
 fn test_threadfence_system_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();

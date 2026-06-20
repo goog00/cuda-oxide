@@ -4,9 +4,11 @@
  */
 
 use dialect_nvvm::ops::{
-    Barrier0Op, FmaBf16x2Op, ReadPtxSregLaneIdOp, ReadPtxSregTidXOp, ReduxSyncAddOp,
-    ReduxSyncAndOp, ReduxSyncMaxOp, ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp,
-    ReduxSyncUminOp, ReduxSyncXorOp, ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
+    Barrier0Op, FmaBf16x2Op, ReadPtxSregLaneIdOp, ReadPtxSregLanemaskEqOp,
+    ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp, ReadPtxSregLanemaskLeOp,
+    ReadPtxSregLanemaskLtOp, ReadPtxSregTidXOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp,
+    ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp, ReduxSyncXorOp,
+    ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -61,6 +63,83 @@ fn test_thread_register_ops_reject_non_i32_results() {
     );
 
     assert!(ReadPtxSregTidXOp::new(op).verify(&ctx).is_err());
+}
+
+#[test]
+fn test_lanemask_ops_verify_i32_results() {
+    let mut ctx = Context::new();
+    dialect_nvvm::register(&mut ctx);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+
+    // Each lane-position mask is a zero-operand, single-i32-result sreg read.
+    let lt = Operation::new(
+        &mut ctx,
+        ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(ReadPtxSregLanemaskLtOp::new(lt).verify(&ctx).is_ok());
+
+    let le = Operation::new(
+        &mut ctx,
+        ReadPtxSregLanemaskLeOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(ReadPtxSregLanemaskLeOp::new(le).verify(&ctx).is_ok());
+
+    let eq = Operation::new(
+        &mut ctx,
+        ReadPtxSregLanemaskEqOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(ReadPtxSregLanemaskEqOp::new(eq).verify(&ctx).is_ok());
+
+    let ge = Operation::new(
+        &mut ctx,
+        ReadPtxSregLanemaskGeOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(ReadPtxSregLanemaskGeOp::new(ge).verify(&ctx).is_ok());
+
+    let gt = Operation::new(
+        &mut ctx,
+        ReadPtxSregLanemaskGtOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(ReadPtxSregLanemaskGtOp::new(gt).verify(&ctx).is_ok());
+}
+
+#[test]
+fn test_lanemask_op_rejects_non_i32_result() {
+    let mut ctx = Context::new();
+    dialect_nvvm::register(&mut ctx);
+
+    // A 64-bit result must fail the shared lane-position mask verifier.
+    let i64_ty = IntegerType::get(&mut ctx, 64, Signedness::Signless);
+    let op = Operation::new(
+        &mut ctx,
+        ReadPtxSregLanemaskLtOp::get_concrete_op_info(),
+        vec![i64_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(ReadPtxSregLanemaskLtOp::new(op).verify(&ctx).is_err());
 }
 
 #[test]

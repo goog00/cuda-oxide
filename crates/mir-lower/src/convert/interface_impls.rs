@@ -54,13 +54,15 @@ use dialect_nvvm::ops::{
     ReadPtxSregClusterIdxOp, ReadPtxSregClusterNctaidXOp, ReadPtxSregClusterNctaidYOp,
     ReadPtxSregClusterNctaidZOp, ReadPtxSregCtaidXOp, ReadPtxSregCtaidYOp, ReadPtxSregCtaidZOp,
     ReadPtxSregEnvReg1Op, ReadPtxSregEnvReg2Op, ReadPtxSregGlobaltimerOp, ReadPtxSregLaneIdOp,
-    ReadPtxSregNclusterIdOp, ReadPtxSregNctaidXOp, ReadPtxSregNctaidYOp, ReadPtxSregNctaidZOp,
-    ReadPtxSregNtidXOp, ReadPtxSregNtidYOp, ReadPtxSregNtidZOp, ReadPtxSregTidXOp,
-    ReadPtxSregTidYOp, ReadPtxSregTidZOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp,
-    ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp, ReduxSyncXorOp,
-    ShflSyncBflyF32Op, ShflSyncBflyI32Op, ShflSyncDownF32Op, ShflSyncDownI32Op, ShflSyncIdxF32Op,
-    ShflSyncIdxI32Op, ShflSyncUpF32Op, ShflSyncUpI32Op, StmatrixM8n8X2Op, StmatrixM8n8X2TransOp,
-    StmatrixM8n8X4Op, StmatrixM8n8X4TransOp, Tcgen05AllocCg2Op, Tcgen05AllocOp, Tcgen05CommitCg2Op,
+    ReadPtxSregLanemaskEqOp, ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp,
+    ReadPtxSregLanemaskLeOp, ReadPtxSregLanemaskLtOp, ReadPtxSregNclusterIdOp,
+    ReadPtxSregNctaidXOp, ReadPtxSregNctaidYOp, ReadPtxSregNctaidZOp, ReadPtxSregNtidXOp,
+    ReadPtxSregNtidYOp, ReadPtxSregNtidZOp, ReadPtxSregTidXOp, ReadPtxSregTidYOp,
+    ReadPtxSregTidZOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp, ReduxSyncMinOp,
+    ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp, ReduxSyncXorOp, ShflSyncBflyF32Op,
+    ShflSyncBflyI32Op, ShflSyncDownF32Op, ShflSyncDownI32Op, ShflSyncIdxF32Op, ShflSyncIdxI32Op,
+    ShflSyncUpF32Op, ShflSyncUpI32Op, StmatrixM8n8X2Op, StmatrixM8n8X2TransOp, StmatrixM8n8X4Op,
+    StmatrixM8n8X4TransOp, Tcgen05AllocCg2Op, Tcgen05AllocOp, Tcgen05CommitCg2Op,
     Tcgen05CommitMulticastCg2Op, Tcgen05CommitOp, Tcgen05CommitSharedClusterCg2Op,
     Tcgen05CommitSharedClusterOp, Tcgen05CpSmemToTmemCg2Op, Tcgen05CpSmemToTmemOp,
     Tcgen05DeallocCg2Op, Tcgen05DeallocOp, Tcgen05FenceAfterThreadSyncOp,
@@ -1150,6 +1152,96 @@ impl MirToLlvmConversion for ReadPtxSregLaneIdOp {
             self.get_operation(),
             operands_info,
             "llvm_nvvm_read_ptx_sreg_laneid",
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ReadPtxSregLanemaskLtOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::basic::convert_sreg_read_i32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "llvm_nvvm_read_ptx_sreg_lanemask_lt",
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ReadPtxSregLanemaskLeOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::basic::convert_sreg_read_i32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "llvm_nvvm_read_ptx_sreg_lanemask_le",
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ReadPtxSregLanemaskEqOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::basic::convert_sreg_read_i32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "llvm_nvvm_read_ptx_sreg_lanemask_eq",
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ReadPtxSregLanemaskGeOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::basic::convert_sreg_read_i32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "llvm_nvvm_read_ptx_sreg_lanemask_ge",
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ReadPtxSregLanemaskGtOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::basic::convert_sreg_read_i32(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
+            "llvm_nvvm_read_ptx_sreg_lanemask_gt",
         )
     }
 }

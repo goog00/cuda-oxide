@@ -113,6 +113,175 @@ impl Verify for ReadPtxSregLaneIdOp {
 }
 
 // =============================================================================
+// Lane-Position Masks
+// =============================================================================
+//
+// Read-only special registers returning a 32-bit mask of the warp lanes in a
+// given position relative to the calling lane. Each is a zero-operand, single
+// i32-result op, lowered to the matching `llvm.nvvm.read.ptx.sreg.lanemask.*`
+// intrinsic. They are plain register reads — not warp-convergent collectives.
+
+/// Read the mask of lanes with ID strictly less than the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.lt` / PTX `%lanemask_lt`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_lt",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskLtOp;
+
+impl ReadPtxSregLanemaskLtOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskLtOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskLtOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_lt")
+    }
+}
+
+/// Read the mask of lanes with ID less than or equal to the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.le` / PTX `%lanemask_le`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_le",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskLeOp;
+
+impl ReadPtxSregLanemaskLeOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskLeOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskLeOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_le")
+    }
+}
+
+/// Read the mask with only the calling lane's bit set.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.eq` / PTX `%lanemask_eq`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_eq",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskEqOp;
+
+impl ReadPtxSregLanemaskEqOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskEqOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskEqOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_eq")
+    }
+}
+
+/// Read the mask of lanes with ID greater than or equal to the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.ge` / PTX `%lanemask_ge`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_ge",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskGeOp;
+
+impl ReadPtxSregLanemaskGeOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskGeOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskGeOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_ge")
+    }
+}
+
+/// Read the mask of lanes with ID strictly greater than the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.gt` / PTX `%lanemask_gt`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_gt",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskGtOp;
+
+impl ReadPtxSregLanemaskGtOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskGtOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskGtOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_gt")
+    }
+}
+
+/// Shared verifier for the lane-position mask ops: a single 32-bit integer result.
+fn verify_lanemask_result(ctx: &Context, op: Ptr<Operation>, op_name: &str) -> Result<(), Error> {
+    let op = &*op.deref(ctx);
+    let res = op.get_result(0);
+    let ty = res.get_type(ctx);
+
+    let ty_obj = ty.deref(ctx);
+    let int_ty = match ty_obj.downcast_ref::<IntegerType>() {
+        Some(ty) => ty,
+        None => {
+            return verify_err!(op.loc(), "{} result must be integer", op_name);
+        }
+    };
+
+    if int_ty.width() != 32 {
+        return verify_err!(op.loc(), "{} result must be 32-bit integer", op_name);
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Warp Shuffle - Integer (i32)
 // =============================================================================
 
@@ -807,6 +976,12 @@ impl ReduxSyncXorOp {
 pub(super) fn register(ctx: &mut Context) {
     // Lane identification
     ReadPtxSregLaneIdOp::register(ctx);
+    // Lane-position masks
+    ReadPtxSregLanemaskLtOp::register(ctx);
+    ReadPtxSregLanemaskLeOp::register(ctx);
+    ReadPtxSregLanemaskEqOp::register(ctx);
+    ReadPtxSregLanemaskGeOp::register(ctx);
+    ReadPtxSregLanemaskGtOp::register(ctx);
     // Shuffle - i32
     ShflSyncIdxI32Op::register(ctx);
     ShflSyncBflyI32Op::register(ctx);
