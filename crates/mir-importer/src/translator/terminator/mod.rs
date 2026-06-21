@@ -3068,6 +3068,18 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
+        "cuda_device::warp::elect_sync" => Ok(Some(intrinsics::warp::emit_elect_sync(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
 
         // =================================================================
         // WGMMA (from intrinsics::wgmma)

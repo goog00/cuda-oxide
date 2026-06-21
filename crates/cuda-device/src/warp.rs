@@ -676,3 +676,78 @@ pub fn redux_sync_xor(mask: u32, value: u32) -> u32 {
     let _ = (mask, value);
     unreachable!("redux_sync_xor called outside CUDA kernel context")
 }
+
+// =============================================================================
+// Leader election (sm_90+)
+// =============================================================================
+//
+// `elect.sync` collectively chooses a single "leader" lane out of those named
+// in `mask`. The hardware picks the lowest-numbered participating lane and
+// hands every lane two facts: the leader's lane id, and whether *it* is the
+// leader. It replaces the pre-Hopper idiom
+//
+// ```rust,ignore
+// let active = warp::active_mask();
+// let leader = active.trailing_zeros();   // lowest set bit
+// let is_leader = warp::lane_id() == leader;
+// ```
+//
+// with one instruction. The classic use is warp-aggregated work: elect one
+// lane to perform a single atomic / allocation / write on behalf of the warp.
+
+/// Elect a single leader lane from the participating `mask` (sm_90+).
+///
+/// PTX `elect.sync d|p, membermask` (emitted as convergent inline PTX — the
+/// `@llvm.nvvm.elect.sync` intrinsic has no NVPTX lowering in current LLVM).
+/// The lowest-numbered lane set in `mask` becomes the leader. Returns
+/// `(leader_lane, is_elected)`:
+///
+/// - `leader_lane`: the lane id of the elected leader — the same value on every
+///   participating lane.
+/// - `is_elected`: `true` only for the calling lane if it is the leader.
+///
+/// Requires Hopper (sm_90+). Convergent: every lane named in `mask` must be
+/// converged at the call (see [`redux_sync_add`] for the full convergence
+/// contract — it is a runtime requirement on the caller, distinct from the
+/// `convergent` attribute on the lowered intrinsic).
+///
+/// Most callers only need "am I the leader?"; reach for [`is_elected_sync`]
+/// in that case and let the leader-id field fold away.
+///
+/// # Example: warp-aggregated counter
+///
+/// ```rust,ignore
+/// // One lane per warp bumps a global counter and broadcasts the base index.
+/// let (leader, elected) = warp::elect_sync(u32::MAX);
+/// let base = if elected {
+///     atomic_add(global_counter, 32)   // only the leader writes
+/// } else {
+///     0
+/// };
+/// // Share the leader's result with the rest of the warp.
+/// let base = warp::shuffle_sync(u32::MAX, base, leader);
+/// ```
+#[inline(never)]
+pub fn elect_sync(mask: u32) -> (u32, bool) {
+    let _ = mask;
+    unreachable!("elect_sync called outside CUDA kernel context")
+}
+
+/// Whether the calling lane is the elected leader of `mask` (sm_90+).
+///
+/// Convenience wrapper over [`elect_sync`] for the common "do this once per
+/// warp" pattern; the elected leader-id field is discarded (and folds away in
+/// codegen). See [`elect_sync`] for the hardware semantics and convergence
+/// contract.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// if warp::is_elected_sync(u32::MAX) {
+///     // Runs on exactly one lane of the warp.
+/// }
+/// ```
+#[inline(always)]
+pub fn is_elected_sync(mask: u32) -> bool {
+    elect_sync(mask).1
+}

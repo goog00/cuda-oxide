@@ -43,7 +43,7 @@ use dialect_nvvm::ops::{
     CpAsyncBulkTensorG2sTile3dOp, CpAsyncBulkTensorG2sTile4dOp, CpAsyncBulkTensorG2sTile5dOp,
     CpAsyncBulkTensorS2gTile1dOp, CpAsyncBulkTensorS2gTile2dOp, CpAsyncBulkTensorS2gTile3dOp,
     CpAsyncBulkTensorS2gTile4dOp, CpAsyncBulkTensorS2gTile5dOp, CpAsyncBulkWaitGroupOp,
-    CpAsyncBulkWaitGroupReadOp, CvtF16x2F32Op, CvtF32x2Bf16x2Op, DsmemReadU32Op,
+    CpAsyncBulkWaitGroupReadOp, CvtF16x2F32Op, CvtF32x2Bf16x2Op, DsmemReadU32Op, ElectSyncOp,
     FenceProxyAsyncSharedCtaOp, FmaBf16x2Op, InlinePtxOp, MapaSharedClusterOp, MatchAllSyncI32Op,
     MatchAllSyncI64Op, MatchAnySyncI32Op, MatchAnySyncI64Op, MbarrierArriveClusterOp,
     MbarrierArriveExpectTxSharedOp, MbarrierArriveSharedOp, MbarrierInitSharedOp,
@@ -1956,6 +1956,23 @@ impl MirToLlvmConversion for MatchAllSyncI64Op {
             operands_info,
             "llvm_nvvm_match_all_sync_i64p",
             i64_ty.into(),
+        )
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for ElectSyncOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::intrinsics::warp::convert_elect_sync(
+            ctx,
+            rewriter,
+            self.get_operation(),
+            operands_info,
         )
     }
 }

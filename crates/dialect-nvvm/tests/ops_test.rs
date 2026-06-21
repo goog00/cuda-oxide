@@ -4,10 +4,11 @@
  */
 
 use dialect_nvvm::ops::{
-    Barrier0Op, FmaBf16x2Op, ReadPtxSregLaneIdOp, ReadPtxSregLanemaskEqOp, ReadPtxSregLanemaskGeOp,
-    ReadPtxSregLanemaskGtOp, ReadPtxSregLanemaskLeOp, ReadPtxSregLanemaskLtOp, ReadPtxSregTidXOp,
-    ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp, ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp,
-    ReduxSyncUminOp, ReduxSyncXorOp, ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
+    Barrier0Op, ElectSyncOp, FmaBf16x2Op, ReadPtxSregLaneIdOp, ReadPtxSregLanemaskEqOp,
+    ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp, ReadPtxSregLanemaskLeOp,
+    ReadPtxSregLanemaskLtOp, ReadPtxSregTidXOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp,
+    ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp, ReduxSyncXorOp,
+    ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -336,4 +337,51 @@ fn test_redux_sync_integer_family_construct_and_verify() {
     check_variant!(ReduxSyncAndOp);
     check_variant!(ReduxSyncOrOp);
     check_variant!(ReduxSyncXorOp);
+}
+
+#[test]
+fn test_elect_sync_construct_and_verify() {
+    let mut ctx = Context::new();
+    dialect_nvvm::register(&mut ctx);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let i1_ty = IntegerType::get(&mut ctx, 1, Signedness::Signless);
+
+    // A block supplies the single `mask` operand.
+    let block = BasicBlock::new(&mut ctx, None, vec![i32_ty.into()]);
+    let mask = block.deref(&ctx).get_argument(0);
+
+    // Valid: 1 operand [mask], 2 results [leader (i32), is_elected (i1)]
+    // (matches NOpdsInterface<1>/NResultsInterface<2>).
+    let op = Operation::new(
+        &mut ctx,
+        ElectSyncOp::get_concrete_op_info(),
+        vec![i32_ty.into(), i1_ty.into()],
+        vec![mask],
+        vec![],
+        0,
+    );
+    assert!(verify_op(&ElectSyncOp::new(op), &ctx).is_ok());
+
+    // Invalid: wrong operand count (0 instead of 1) must fail verification.
+    let bad_opnds = Operation::new(
+        &mut ctx,
+        ElectSyncOp::get_concrete_op_info(),
+        vec![i32_ty.into(), i1_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    assert!(verify_op(&ElectSyncOp::new(bad_opnds), &ctx).is_err());
+
+    // Invalid: wrong result count (1 instead of 2) must fail verification.
+    let bad_results = Operation::new(
+        &mut ctx,
+        ElectSyncOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![mask],
+        vec![],
+        0,
+    );
+    assert!(verify_op(&ElectSyncOp::new(bad_results), &ctx).is_err());
 }
