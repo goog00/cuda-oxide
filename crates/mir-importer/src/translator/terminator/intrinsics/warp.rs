@@ -579,6 +579,92 @@ pub fn emit_warp_redux(
     )
 }
 
+/// Emit a warp reduction operation for f32 (`redux.sync.fmin/fmax`).
+///
+/// Same MIR shape as [`emit_warp_redux`]: 2 operands `[mask, value]` and 1
+/// result. The result type is `f32` so it matches an `f32` destination local.
+pub fn emit_warp_redux_f32(
+    ctx: &mut Context,
+    body: &mir::Body,
+    redux_opid: (
+        fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
+        std::any::TypeId,
+    ),
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use pliron::builtin::types::FP32Type;
+
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "warp redux f32 expects 2 arguments [mask, value], got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let f32_type = FP32Type::get(ctx);
+
+    let (mask, mut last_op) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+
+    let (value, last_op_after) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after;
+
+    let redux_op = Operation::new(
+        ctx,
+        redux_opid,
+        vec![f32_type.into()],
+        vec![mask, value],
+        vec![],
+        0,
+    );
+    redux_op.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        redux_op.insert_after(ctx, prev);
+    } else {
+        redux_op.insert_at_front(block_ptr, ctx);
+    }
+
+    let result_value = redux_op.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result_value,
+        target,
+        block_ptr,
+        redux_op,
+        value_map,
+        block_map,
+        loc,
+        "warp redux f32 call without target block",
+    )
+}
+
 /// Emit `elect.sync`: elect the lowest participating lane as leader (sm_90+).
 ///
 /// The device fn returns `(u32, bool)` = `(leader_lane, is_elected)`. The LLVM

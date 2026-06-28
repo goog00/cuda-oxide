@@ -972,6 +972,42 @@ impl ReduxSyncXorOp {
     }
 }
 
+/// Warp single-precision minimum reduction. `llvm.nvvm.redux.sync.fmin` / PTX
+/// `redux.sync.min.f32`. sm_100a+, convergent. Operands `[mask, value]`
+/// (i32 mask, f32 value), result `f32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_fmin",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncFminOp;
+
+impl ReduxSyncFminOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncFminOp { op }
+    }
+}
+
+/// Warp single-precision maximum reduction. `llvm.nvvm.redux.sync.fmax` / PTX
+/// `redux.sync.max.f32`. sm_100a+, convergent. Operands `[mask, value]`
+/// (i32 mask, f32 value), result `f32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_fmax",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncFmaxOp;
+
+impl ReduxSyncFmaxOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncFmaxOp { op }
+    }
+}
+
 // =============================================================================
 // Leader Election (sm_90+)
 // =============================================================================
@@ -1047,6 +1083,9 @@ pub(super) fn register(ctx: &mut Context) {
     ReduxSyncAndOp::register(ctx);
     ReduxSyncOrOp::register(ctx);
     ReduxSyncXorOp::register(ctx);
+    // Floating-point reduction (sm_100a+)
+    ReduxSyncFminOp::register(ctx);
+    ReduxSyncFmaxOp::register(ctx);
     // Leader election (sm_90+)
     ElectSyncOp::register(ctx);
     // Active mask

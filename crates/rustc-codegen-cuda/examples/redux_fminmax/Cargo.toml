@@ -1,0 +1,22 @@
+[package]
+name = "redux_fminmax"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Mark as standalone crate (not part of parent workspace)
+[workspace]
+
+# This example demonstrates the single-instruction warp floating-point
+# reductions `redux.sync.fmin/fmax` (sm_100a+). Build with:
+#   cargo oxide run redux_fminmax --arch sm_100a
+
+[dependencies]
+# Device-side intrinsics (warp::redux_sync_fmin, _fmax)
+cuda-device = { path = "../../../cuda-device" }
+
+# Host-side utilities (CudaKernel trait, etc.)
+cuda-host = { path = "../../../cuda-host" }
+
+# Host-side CUDA runtime
+cuda-core = { path = "../../../cuda-core" }

@@ -6,13 +6,13 @@
 use dialect_nvvm::ops::{
     Barrier0Op, ElectSyncOp, FmaBf16x2Op, ReadPtxSregLaneIdOp, ReadPtxSregLanemaskEqOp,
     ReadPtxSregLanemaskGeOp, ReadPtxSregLanemaskGtOp, ReadPtxSregLanemaskLeOp,
-    ReadPtxSregLanemaskLtOp, ReadPtxSregTidXOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncMaxOp,
-    ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp, ReduxSyncUminOp, ReduxSyncXorOp,
-    ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
+    ReadPtxSregLanemaskLtOp, ReadPtxSregTidXOp, ReduxSyncAddOp, ReduxSyncAndOp, ReduxSyncFmaxOp,
+    ReduxSyncFminOp, ReduxSyncMaxOp, ReduxSyncMinOp, ReduxSyncOrOp, ReduxSyncUmaxOp,
+    ReduxSyncUminOp, ReduxSyncXorOp, ThreadfenceBlockOp, ThreadfenceOp, ThreadfenceSystemOp,
 };
 use pliron::{
     basic_block::BasicBlock,
-    builtin::types::{IntegerType, Signedness},
+    builtin::types::{FP32Type, IntegerType, Signedness},
     common_traits::Verify,
     context::Context,
     op::{Op, verify_op},
@@ -337,6 +337,55 @@ fn test_redux_sync_integer_family_construct_and_verify() {
     check_variant!(ReduxSyncAndOp);
     check_variant!(ReduxSyncOrOp);
     check_variant!(ReduxSyncXorOp);
+}
+
+#[test]
+fn test_redux_sync_f32_construct_and_verify() {
+    let mut ctx = Context::new();
+    dialect_nvvm::register(&mut ctx);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let f32_ty = FP32Type::get(&mut ctx);
+
+    // A block supplies [mask (i32), value (f32)].
+    let block = BasicBlock::new(&mut ctx, None, vec![i32_ty.into(), f32_ty.into()]);
+    let mask = block.deref(&ctx).get_argument(0);
+    let value = block.deref(&ctx).get_argument(1);
+
+    macro_rules! check_variant {
+        ($op:ty) => {{
+            let good = Operation::new(
+                &mut ctx,
+                <$op>::get_concrete_op_info(),
+                vec![f32_ty.into()],
+                vec![mask, value],
+                vec![],
+                0,
+            );
+            assert!(
+                verify_op(&<$op>::new(good), &ctx).is_ok(),
+                "{} should verify with [mask, value] -> f32",
+                stringify!($op)
+            );
+
+            let bad = Operation::new(
+                &mut ctx,
+                <$op>::get_concrete_op_info(),
+                vec![f32_ty.into()],
+                vec![mask],
+                vec![],
+                0,
+            );
+            assert!(
+                verify_op(&<$op>::new(bad), &ctx).is_err(),
+                "{} must reject a single operand",
+                stringify!($op)
+            );
+        }};
+    }
+
+    check_variant!(ReduxSyncFminOp);
+    check_variant!(ReduxSyncFmaxOp);
 }
 
 #[test]

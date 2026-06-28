@@ -250,9 +250,9 @@ mod tests {
         assert!(ModuleExportState::is_convergent_intrinsic(
             "llvm.nvvm.redux.sync.add"
         ));
-        // The whole redux.sync integer family is a warp collective and must be
-        // flagged convergent (the `llvm.nvvm.redux` prefix covers every name
-        // lowered by the redux ops).
+        // The whole redux.sync integer and f32 family is a warp collective and
+        // must be flagged convergent (the `llvm.nvvm.redux` prefix covers every
+        // name lowered by the redux ops).
         for name in [
             "llvm.nvvm.redux.sync.umin",
             "llvm.nvvm.redux.sync.min",
@@ -261,6 +261,8 @@ mod tests {
             "llvm.nvvm.redux.sync.and",
             "llvm.nvvm.redux.sync.or",
             "llvm.nvvm.redux.sync.xor",
+            "llvm.nvvm.redux.sync.fmin",
+            "llvm.nvvm.redux.sync.fmax",
         ] {
             assert!(
                 ModuleExportState::is_convergent_intrinsic(name),
