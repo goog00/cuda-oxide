@@ -8,7 +8,13 @@ license = "Apache-2.0"
 [workspace]
 
 # This example demonstrates the single-instruction warp floating-point
-# reductions `redux.sync.fmin/fmax` (sm_100a+). Build with:
+# reductions `redux.sync.fmin/fmax` (sm_100a, datacenter Blackwell).
+#
+# NOTE: consumer Blackwell (RTX 50 series, sm_120) does NOT support
+# `redux.sync.f32`; this example requires datacenter Blackwell (B100/B200,
+# sm_100a).
+#
+# Build and run with:
 #   cargo oxide run redux_fminmax --arch sm_100a
 
 [dependencies]

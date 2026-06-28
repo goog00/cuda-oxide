@@ -583,6 +583,9 @@ pub fn emit_warp_redux(
 ///
 /// Same MIR shape as [`emit_warp_redux`]: 2 operands `[mask, value]` and 1
 /// result. The result type is `f32` so it matches an `f32` destination local.
+///
+/// NOTE: `redux.sync.f32` is only available on datacenter Blackwell (sm_100a);
+/// consumer Blackwell (sm_120) does not support it.
 pub fn emit_warp_redux_f32(
     ctx: &mut Context,
     body: &mir::Body,

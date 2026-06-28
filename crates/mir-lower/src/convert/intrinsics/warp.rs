@@ -251,6 +251,9 @@ pub(crate) fn convert_redux(
 /// Op operand layout is `[mask, value]` (matching the other `*_sync`
 /// collectives), but the LLVM intrinsic signature is `(src, membermask)`, so
 /// we forward the operands flipped as `[value, mask]`. Result is f32.
+///
+/// NOTE: `redux.sync.f32` is only available on datacenter Blackwell (sm_100a);
+/// consumer Blackwell (sm_120) does not support it.
 pub(crate) fn convert_redux_f32(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,

@@ -3,11 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Single-instruction warp floating-point reductions (`redux.sync.fmin/fmax`, sm_100a+).
+//! Single-instruction warp floating-point reductions (`redux.sync.fmin/fmax`,
+//! datacenter Blackwell sm_100a).
 //!
 //! Companion to `redux_sum` and `redux_minmax`. This example exercises the
 //! Blackwell f32 min/max warp reductions, lowered to one hardware `redux.sync.*`
 //! instruction instead of a `shfl`-based log-tree.
+//!
+//! NOTE: `redux.sync.f32` is only available on datacenter Blackwell (B100/B200,
+//! sm_100a). Consumer Blackwell (RTX 50 series, sm_120) does not support it, so
+//! the host code skips the kernel launch on sm_120.
 //!
 //! Build and run with:
 //!   cargo oxide run redux_fminmax --arch sm_100a
@@ -52,7 +57,7 @@ mod kernels {
 fn main() {
     use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 
-    println!("=== redux.sync.fmin/fmax (sm_100a+) ===\n");
+    println!("=== redux.sync.fmin/fmax (datacenter Blackwell sm_100a) ===\n");
 
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
     let stream = ctx.default_stream();
@@ -60,9 +65,16 @@ fn main() {
     let (major, minor) = ctx.compute_capability().expect("compute capability");
     println!("GPU Compute Capability: sm_{}{}", major, minor);
 
-    // `redux.sync.f32` is a Blackwell instruction; the PTX won't assemble below sm_100a.
+    // `redux.sync.f32` requires datacenter Blackwell (sm_100a). It is NOT
+    // available on consumer Blackwell (RTX 50 series, sm_120).
     if major < 10 {
-        println!("\nskipping: redux.sync.fmin/fmax requires sm_100a+ (Blackwell)");
+        println!("\nskipping: redux.sync.fmin/fmax requires Blackwell (sm_100a+)");
+        println!("  this GPU is sm_{}{}", major, minor);
+        return;
+    }
+    if major == 12 {
+        println!("\nskipping: redux.sync.f32 is not available on consumer Blackwell (sm_120)");
+        println!("  it requires datacenter Blackwell (B100/B200, sm_100a)");
         println!("  this GPU is sm_{}{}", major, minor);
         return;
     }

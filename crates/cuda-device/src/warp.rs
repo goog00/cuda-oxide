@@ -678,28 +678,37 @@ pub fn redux_sync_xor(mask: u32, value: u32) -> u32 {
 }
 
 // -----------------------------------------------------------------------------
-// Floating-point min/max reductions (sm_100a+).
+// Floating-point min/max reductions (datacenter Blackwell sm_100a).
 //
 // Blackwell extends `redux.sync` to f32 min/max. There is intentionally no
 // `add.f32`: floating-point addition is not associative, so a warp-wide sum
 // would not have a well-defined result. The base `fmin`/`fmax` variants are
 // provided first; `abs` and `NaN` variants are left for a future PR.
+//
+// NOTE: `redux.sync.f32` is only available on datacenter Blackwell (B100/B200,
+// sm_100a). Consumer Blackwell (RTX 50 series, sm_120) does not support it.
 // -----------------------------------------------------------------------------
 
-/// Warp-wide single-precision minimum reduction (single instruction, sm_100a+).
+/// Warp-wide single-precision minimum reduction (single instruction, sm_100a).
 ///
 /// Lowered to `@llvm.nvvm.redux.sync.fmin` → PTX `redux.sync.min.f32`.
 /// Convergent; participating lanes must be converged at the call.
+///
+/// NOTE: this instruction is only available on datacenter Blackwell (B100/B200,
+/// sm_100a). It is not supported on consumer Blackwell (RTX 50 series, sm_120).
 #[inline(never)]
 pub fn redux_sync_fmin(mask: u32, value: f32) -> f32 {
     let _ = (mask, value);
     unreachable!("redux_sync_fmin called outside CUDA kernel context")
 }
 
-/// Warp-wide single-precision maximum reduction (single instruction, sm_100a+).
+/// Warp-wide single-precision maximum reduction (single instruction, sm_100a).
 ///
 /// Lowered to `@llvm.nvvm.redux.sync.fmax` → PTX `redux.sync.max.f32`.
 /// Convergent; participating lanes must be converged at the call.
+///
+/// NOTE: this instruction is only available on datacenter Blackwell (B100/B200,
+/// sm_100a). It is not supported on consumer Blackwell (RTX 50 series, sm_120).
 #[inline(never)]
 pub fn redux_sync_fmax(mask: u32, value: f32) -> f32 {
     let _ = (mask, value);

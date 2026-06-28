@@ -973,8 +973,9 @@ impl ReduxSyncXorOp {
 }
 
 /// Warp single-precision minimum reduction. `llvm.nvvm.redux.sync.fmin` / PTX
-/// `redux.sync.min.f32`. sm_100a+, convergent. Operands `[mask, value]`
-/// (i32 mask, f32 value), result `f32`.
+/// `redux.sync.min.f32`. Datacenter Blackwell (sm_100a) only; not available on
+/// consumer Blackwell (sm_120). Convergent. Operands `[mask, value]` (i32 mask,
+/// f32 value), result `f32`.
 #[pliron_op(
     name = "nvvm.redux_sync_fmin",
     format,
@@ -991,8 +992,9 @@ impl ReduxSyncFminOp {
 }
 
 /// Warp single-precision maximum reduction. `llvm.nvvm.redux.sync.fmax` / PTX
-/// `redux.sync.max.f32`. sm_100a+, convergent. Operands `[mask, value]`
-/// (i32 mask, f32 value), result `f32`.
+/// `redux.sync.max.f32`. Datacenter Blackwell (sm_100a) only; not available on
+/// consumer Blackwell (sm_120). Convergent. Operands `[mask, value]` (i32 mask,
+/// f32 value), result `f32`.
 #[pliron_op(
     name = "nvvm.redux_sync_fmax",
     format,
