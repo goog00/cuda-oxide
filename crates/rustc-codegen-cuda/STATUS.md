@@ -17,7 +17,6 @@ Run `scripts/check-error-example-status.sh` to verify both are in sync.
 | `error_drop_glue`                     | support-gap         | `TerminatorKind::Drop` (effectful)  |
 | `error_heap_alloc`                    | diagnostics-fixture | `__rust_alloc` reachable (#108)     |
 | `error_missing_device_attr`           | diagnostics-fixture | `thread::index_*` stub (#76)        |
-| `error_set_discriminant_unhandled`    | support-gap         | `StatementKind::SetDiscriminant`    |
 | `error_static_initializer_provenance` | support-gap         | Device-global pointer relocation    |
 | `error_wgmma_mma_unimplemented`       | support-gap         | WGMMA MMA lowering                  |
 

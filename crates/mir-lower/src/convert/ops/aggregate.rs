@@ -19,6 +19,7 @@
 //! | `mir.construct_slice`    | `llvm.undef` + `llvm.insertvalue`    | Build slice fat ptr    |
 //! | `mir.construct_enum`     | `llvm.undef` + `llvm.insertvalue`    | Build enum             |
 //! | `mir.get_discriminant`   | `llvm.extractvalue`                  | Get enum tag           |
+//! | `mir.set_discriminant`   | `llvm.getelementptr` + `llvm.store`  | Write enum tag         |
 //! | `mir.enum_payload`       | `llvm.extractvalue`                  | Get enum payload       |
 //!
 //! # Enum Representation
@@ -918,6 +919,58 @@ fn enum_slot_map_of_operand(
     let mir_ty: TypeHandle = pliron::r#type::Type::register_instance(enum_ty, ctx).into();
     let map = build_enum_slot_map(ctx, mir_ty).map_err(anyhow_to_pliron)?;
     Ok((map, abi_align))
+}
+
+/// Convert `mir.set_discriminant` (writing an enum's tag) to
+/// `llvm.getelementptr` + `llvm.store`.
+///
+/// The tag is written into the slot map's `tag_slot`. The discriminant
+/// value operand is already the variant's DECLARED discriminant, so no
+/// index-to-value translation is needed here.
+pub(crate) fn convert_set_discriminant(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let enum_ptr = op.deref(ctx).get_operand(0);
+    let discr_val = op.deref(ctx).get_operand(1);
+
+    let enum_ty: MirEnumType = {
+        let mir_ptr_pointee =
+            match operands_info.lookup_most_recent_of_type::<MirPtrType>(ctx, enum_ptr) {
+                Some(r) => r.pointee,
+                None => {
+                    return pliron::input_err_noloc!(
+                        "MirSetDiscriminantOp operand must be pointer type"
+                    );
+                }
+            };
+        match mir_ptr_pointee.deref(ctx).downcast_ref::<MirEnumType>() {
+            Some(et) => et.clone(),
+            None => {
+                return pliron::input_err_noloc!(
+                    "MirSetDiscriminantOp pointer must point to enum type"
+                );
+            }
+        }
+    };
+
+    let mir_ty: TypeHandle = pliron::r#type::Type::register_instance(enum_ty, ctx).into();
+    let slot_map = build_enum_slot_map(ctx, mir_ty).map_err(anyhow_to_pliron)?;
+    let llvm_struct_ty = slot_map.llvm_struct_ty;
+
+    use llvm_export::ops::GepIndex;
+    let gep_indices = vec![GepIndex::Constant(0), GepIndex::Constant(slot_map.tag_slot)];
+    let tag_ptr_op = llvm::GetElementPtrOp::new(ctx, enum_ptr, gep_indices, llvm_struct_ty);
+    rewriter.insert_operation(ctx, tag_ptr_op.get_operation());
+
+    let tag_ptr = tag_ptr_op.get_operation().deref(ctx).get_result(0);
+    let store_op = llvm::StoreOp::new(ctx, discr_val, tag_ptr);
+    rewriter.insert_operation(ctx, store_op.get_operation());
+
+    rewriter.erase_operation(ctx, op);
+    Ok(())
 }
 
 /// Convert `mir.get_discriminant` (reading which variant is alive) to

@@ -14,6 +14,7 @@
 //! | `Assign(_l, rv)`    | Rvalue → ops; result stored into `_l`'s alloca slot  |
 //! | `*ptr = val`        | `mir.store`                                          |
 //! | `s.field = val`     | `mir.field_addr` + `mir.store` through the slot      |
+//! | `SetDiscriminant`   | `mir.set_discriminant` (enum tag write)              |
 //! | `StorageLive`       | `mir.storage_live` (lifetime marker)                 |
 //! | `StorageDead`       | `mir.storage_dead` (lifetime marker)                 |
 //! | `Nop`               | Skipped                                              |
@@ -38,18 +39,24 @@ use crate::error::{TranslationErr, TranslationResult};
 use crate::translator::location::span_to_location;
 use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
-use dialect_mir::ops::{MirMemcpyOp, MirStorageDeadOp, MirStorageLiveOp, MirStoreOp};
+use dialect_mir::ops::{
+    MirConstantOp, MirMemcpyOp, MirSetDiscriminantOp, MirStorageDeadOp, MirStorageLiveOp,
+    MirStoreOp,
+};
+use dialect_mir::types::MirEnumType;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::printable::Printable;
 use pliron::r#type::Typed;
 use pliron::utils::apint::APInt;
 use pliron::value::Value;
 use pliron::{input_err, input_error};
 use rustc_public::mir;
+use rustc_public_bridge::IndexedVal;
 use std::num::NonZeroUsize;
 
 /// Translates a MIR statement to one or more `dialect-mir` operations.
@@ -842,15 +849,157 @@ pub fn translate_statement(
         // Statements with observable runtime effect that are not yet lowered.
         // Returning a hard error here converts what was previously a silent
         // miscompile (the catch-all `Ok(prev_op)`) into a clear build failure.
-        // `SetDiscriminant` mutates an enum's discriminant and must be
-        // implemented before it can be accepted.
-        mir::StatementKind::SetDiscriminant { .. } => input_err!(
-            loc,
-            TranslationErr::unsupported(
-                "SetDiscriminant statements are not yet supported on the device; \
-                 until they are lowered, enum discriminant writes would be silently dropped",
-            )
-        ),
+        // `SetDiscriminant` mutates an enum's discriminant in place.
+        mir::StatementKind::SetDiscriminant {
+            place,
+            variant_index,
+        } => {
+            // Resolve the enum type of the place being mutated and extract
+            // everything we need from it inside a scoped block so the deref
+            // guard is dropped before we mutably borrow `ctx` again.
+            let (discr_ty_handle, discr_width, discr_signedness, discr_value) =
+                {
+                    let place_ty = place.ty(body.locals()).map_err(|e| {
+                        input_error!(
+                            loc.clone(),
+                            TranslationErr::unsupported(format!(
+                                "Failed to resolve place type for SetDiscriminant: {:?}",
+                                e
+                            ))
+                        )
+                    })?;
+                    let enum_mir_ty = types::translate_type(ctx, &place_ty)?;
+                    let enum_ty_obj = enum_mir_ty.deref(ctx);
+                    let enum_ty = match enum_ty_obj.downcast_ref::<MirEnumType>() {
+                        Some(et) => et,
+                        None => {
+                            return input_err!(
+                                loc,
+                                TranslationErr::unsupported(format!(
+                                    "SetDiscriminant place type is not an enum: {}",
+                                    enum_mir_ty.disp(ctx)
+                                ))
+                            );
+                        }
+                    };
+
+                    // Niche-encoded enums (total_size == 0 with multiple variants)
+                    // require rewriting the payload scalar, not just storing a
+                    // tag. Reject them loudly until that path is implemented.
+                    if enum_ty.total_size() == 0 && enum_ty.variant_count() > 1 {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(
+                                "SetDiscriminant for niche-encoded enums is not yet supported"
+                                    .to_string()
+                            )
+                        );
+                    }
+
+                    let variant_idx = variant_index.to_index();
+                    let discr_value = *enum_ty.variant_discriminants.get(variant_idx).ok_or_else(
+                        || {
+                            input_error!(
+                                loc.clone(),
+                                TranslationErr::unsupported(format!(
+                                    "SetDiscriminant variant index {} out of bounds for enum '{}'",
+                                    variant_idx,
+                                    enum_ty.name()
+                                ))
+                            )
+                        },
+                    )?;
+
+                    let discr_ty_handle = enum_ty.discriminant_type();
+                    let (discr_width, discr_signedness) = {
+                        let discr_ty_obj = discr_ty_handle.deref(ctx);
+                        match discr_ty_obj.downcast_ref::<IntegerType>() {
+                            Some(it) => (it.width(), it.signedness()),
+                            None => {
+                                return input_err!(
+                                    loc,
+                                    TranslationErr::unsupported(
+                                        "SetDiscriminant enum discriminant type is not an integer"
+                                            .to_string()
+                                    )
+                                );
+                            }
+                        }
+                    };
+
+                    (discr_ty_handle, discr_width, discr_signedness, discr_value)
+                };
+
+            // Build the constant discriminant value.
+            let discr_apint = APInt::from_u64(
+                discr_value,
+                NonZeroUsize::new(discr_width as usize).unwrap(),
+            );
+            let discr_ty_typed = IntegerType::get(ctx, discr_width, discr_signedness);
+            let discr_attr =
+                pliron::builtin::attributes::IntegerAttr::new(discr_ty_typed, discr_apint);
+            let const_op = Operation::new(
+                ctx,
+                MirConstantOp::get_concrete_op_info(),
+                vec![discr_ty_handle],
+                vec![],
+                vec![],
+                0,
+            );
+            const_op.deref_mut(ctx).set_loc(loc.clone());
+            MirConstantOp::new(const_op).set_attr_value(ctx, discr_attr);
+
+            if let Some(prev) = prev_op {
+                const_op.insert_after(ctx, prev);
+            } else {
+                const_op.insert_at_front(block_ptr, ctx);
+            }
+            let const_prev = Some(const_op);
+            let discr_val = const_op.deref(ctx).get_result(0);
+
+            // Get the address of the enum place.
+            let (enum_ptr, addr_prev) = match rvalue::translate_place_address(
+                ctx,
+                body,
+                value_map,
+                place,
+                /* is_mutable */ true,
+                block_ptr,
+                const_prev,
+                loc.clone(),
+            )? {
+                Some(pair) => pair,
+                None => {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(
+                            "SetDiscriminant place has no addressable slot".to_string()
+                        )
+                    );
+                }
+            };
+
+            // The pointer type is determined by the place address walker;
+            // MirSetDiscriminantOp's verifier will catch any type mismatch.
+            let set_op = Operation::new(
+                ctx,
+                MirSetDiscriminantOp::get_concrete_op_info(),
+                vec![],
+                vec![enum_ptr, discr_val],
+                vec![],
+                0,
+            );
+            set_op.deref_mut(ctx).set_loc(loc.clone());
+
+            let insert_after = addr_prev.or(const_prev);
+            if let Some(prev) = insert_after {
+                set_op.insert_after(ctx, prev);
+            } else {
+                set_op.insert_at_front(block_ptr, ctx);
+            }
+
+            Ok(Some(set_op))
+        }
     }
 }
 
